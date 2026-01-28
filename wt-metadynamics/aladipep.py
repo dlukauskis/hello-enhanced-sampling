@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Create a System for alanine dipeptide in water.
+total_steps = 500000
 
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
@@ -44,7 +45,8 @@ simulation.context.setPositions(pdb_file.positions)
 simulation.reporters.append(StateDataReporter(
     stdout, 50000, step=True,
     temperature=True,progress=True,
-    remainingTime=True,speed=True,totalSteps=500000, separator=' ')
+    remainingTime=True,speed=True,
+    totalSteps=total_steps, separator=' ')
 )
 
 # TODO: finish writing a reporter class to write the biased CVs to a file + the hill heights
@@ -52,7 +54,7 @@ meta.reporters.append(
     MetadynamicsReporter('HILLS', 1000, time=True, separator=' ')
 )
 
-meta.step(simulation, 500000)
+meta.step(simulation, total_steps)
 
 # TODO: flip the axes to match conventional representation of phi/psi
 # Create a contour plot of the free energy landscape.
