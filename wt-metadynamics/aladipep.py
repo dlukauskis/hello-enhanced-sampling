@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Create a System for alanine dipeptide in water.
-total_steps = 500000
+total_steps = 5000
 
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
@@ -49,7 +49,6 @@ simulation.reporters.append(StateDataReporter(
     totalSteps=total_steps, separator=' ')
 )
 
-# TODO: finish writing a reporter class to write the biased CVs to a file + the hill heights
 meta.reporters.append(
     MetadynamicsReporter('HILLS', 1000, time=True, separator=' ')
 )
