@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Create a System for alanine dipeptide in water.
-total_steps = 5000
+total_steps = 500000
 
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
@@ -50,12 +50,19 @@ simulation.reporters.append(StateDataReporter(
 )
 
 meta.reporters.append(
-    MetadynamicsReporter('HILLS', 1000, time=True, separator=' ')
+    MetadynamicsReporter('HILLS', 1000)
 )
 
 meta.step(simulation, total_steps)
 
-# TODO: flip the axes to match conventional representation of phi/psi
 # Create a contour plot of the free energy landscape.
-plt.imshow(meta.getFreeEnergy())
+plt.imshow(
+    meta.getFreeEnergy(),
+    extent=(-180, 180, -180, 180),
+    origin='lower', cmap='viridis',
+)
+plt.colorbar(label='Free Energy (kJ/mol)')
+plt.xlabel('Phi (degrees)')
+plt.ylabel('Psi (degrees)')
+plt.title('Free Energy Landscape of Alanine Dipeptide in vacuo')
 plt.show()
