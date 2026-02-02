@@ -7,9 +7,10 @@ from metadynamics import Metadynamics, BiasVariable
 from metadynamicsreporter import MetadynamicsReporter
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 # Create a System for alanine dipeptide in water.
-total_steps = 500000
+total_steps = 100000
 
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
@@ -55,14 +56,28 @@ meta.reporters.append(
 
 meta.step(simulation, total_steps)
 
-# Create a contour plot of the free energy landscape.
-plt.imshow(
-    meta.getFreeEnergy(),
-    extent=(-180, 180, -180, 180),
-    origin='lower', cmap='viridis',
-)
-plt.colorbar(label='Free Energy (kJ/mol)')
-plt.xlabel('Phi (degrees)')
-plt.ylabel('Psi (degrees)')
-plt.title('Free Energy Landscape of Alanine Dipeptide in vacuo')
+# Plot CV time series
+df_cv = pd.read_csv('HILLS', delimiter='\s+', skiprows=7, header=None)
+df_cv.columns = ['step', 'time(ps)', 'cv0', 'cv1', 'sigma_cv0', 'sigma_cv1', 'hill_height', 'bias_factor']
+
+# Create subplots
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+
+# left: free energy heatmap
+fe = meta.getFreeEnergy()
+im = ax0.imshow(fe, extent=(-180, 180, -180, 180), origin='lower', cmap='viridis', aspect='auto')
+ax0.set_xlabel('Phi (degrees)')
+ax0.set_ylabel('Psi (degrees)')
+ax0.set_title('Free Energy Landscape of Alanine Dipeptide in vacuo')
+cbar = fig.colorbar(im, ax=ax0)
+cbar.set_label('Free Energy (kJ/mol)')
+
+# right: CV time series
+ax1.scatter(df_cv['time(ps)'], np.rad2deg(df_cv['cv0']), s=8, alpha=0.7, label='phi')
+ax1.scatter(df_cv['time(ps)'], np.rad2deg(df_cv['cv1']), s=8, alpha=0.7, label='psi')
+ax1.set_xlabel('Time (ps)')
+ax1.set_ylabel('CV values (degrees)')
+ax1.set_title('Wt-metadynamics Collective Variables over Time')
+ax1.legend()
+
 plt.show()
