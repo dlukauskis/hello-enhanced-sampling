@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # Create a System for alanine dipeptide in water.
-total_steps = 100000
+total_steps = 500000
 
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
@@ -80,4 +80,8 @@ ax1.set_ylabel('CV values (degrees)')
 ax1.set_title('Wt-metadynamics Collective Variables over Time')
 ax1.legend()
 
+plt.savefig('fes_cvs.png', dpi=300)
 plt.show()
+
+# TODO: plot the free energy convergence over time by integrating the hills
+
