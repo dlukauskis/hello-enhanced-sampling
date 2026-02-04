@@ -9,9 +9,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# Create a System for alanine dipeptide in water.
+# Simulation parameters
 total_steps = 500000
+hills_pace = 500
+hills_write_pace = 500
+bias_f = 6
 
+# Create a System for alanine dipeptide in vacuo
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
 
@@ -32,10 +36,9 @@ sigma_cv1 = 0.35
 psi = BiasVariable(cv2, -np.pi, np.pi, sigma_cv1, True)
 
 # Set up the simulation.
-bias_f = 6
 meta = Metadynamics(
     system, [phi, psi], 300.0 * kelvin,
-    bias_f, 1.2 * kilojoules_per_mole, 100
+    bias_f, 1.2 * kilojoules_per_mole, hills_pace,
 )
 integrator = LangevinIntegrator(
     300 * kelvin, 1.0 / picosecond, 0.002 * picosecond
@@ -51,7 +54,7 @@ simulation.reporters.append(StateDataReporter(
 )
 
 meta.reporters.append(
-    MetadynamicsReporter('HILLS', 1000)
+    MetadynamicsReporter('HILLS', hills_write_pace)
 )
 
 meta.step(simulation, total_steps)
