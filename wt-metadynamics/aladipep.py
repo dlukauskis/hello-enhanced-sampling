@@ -61,14 +61,15 @@ meta.step(simulation, total_steps)
 
 # Plot CV time series
 df_cv = pd.read_csv('HILLS', delimiter='\s+', skiprows=7, header=None)
-df_cv.columns = ['step', 'time(ps)', 'cv0', 'cv1', 'sigma_cv0', 'sigma_cv1', 'hill_height', 'bias_factor']
+df_cv.columns = ['time(ps)', 'cv0', 'cv1', 'sigma_cv0', 'sigma_cv1', 'hill_height', 'bias_factor']
 
 # Create subplots
 fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
 
 # left: free energy heatmap
-fe = meta.getFreeEnergy()
-im = ax0.imshow(fe, extent=(-180, 180, -180, 180), origin='lower', cmap='viridis', aspect='auto')
+fes = meta.getFreeEnergy()
+fes -= np.min(fes)  # shift to zero
+im = ax0.imshow(fes, extent=(-180, 180, -180, 180), origin='lower', cmap='viridis', aspect='auto')
 ax0.set_xlabel('Phi (degrees)')
 ax0.set_ylabel('Psi (degrees)')
 ax0.set_title('Free Energy Landscape of Alanine Dipeptide in vacuo')
