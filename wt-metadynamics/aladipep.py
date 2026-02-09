@@ -5,15 +5,46 @@ from openmm.app import *
 from openmm.unit import kelvin, kilojoules_per_mole, picosecond
 from metadynamics import Metadynamics, BiasVariable
 from metadynamicsreporter import MetadynamicsReporter
+from ctmd import compute_ct
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
 # Simulation parameters
-total_steps = 500000
+total_steps = 50000
 hills_pace = 500
 hills_write_pace = 500
 bias_f = 6
+
+
+# Helper function to marginalize 2D bias to 1D and compute c(t)
+def compute_ct_1d(meta, cv_index):
+    """Marginalize 2D bias to 1D along specified CV and compute c(t)
+
+    Proper marginalization: P(s_i) = integral of exp(-beta*V(s_i, s_j)) ds_j
+    This requires taking the minimum free energy along the other dimension
+    """
+    beta = 1 / (0.008314 * 300)
+    bias_2d = meta._totalBias
+
+    # Marginalize: take minimum along the other CV axis
+    # (Free energy = -1/beta * log(integral of exp(-beta*V)))
+    if cv_index == 0:
+        # Marginalize over CV1 (psi), keeping CV0 (phi)
+        # Find minimum free energy along psi for each phi value
+        bias_1d = np.min(bias_2d, axis=1)
+    else:
+        # Marginalize over CV0 (phi), keeping CV1 (psi)
+        # Find minimum free energy along phi for each psi value
+        bias_1d = np.min(bias_2d, axis=0)
+
+    # Create grid for the marginalized CV
+    cv = meta.variables[cv_index]
+    s_grid = np.linspace(cv.minValue, cv.maxValue, len(bias_1d))
+
+    return compute_ct(s_grid, bias_1d, beta, meta.biasFactor)
+
+
 
 # Create a System for alanine dipeptide in vacuo
 pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
@@ -57,10 +88,18 @@ meta.reporters.append(
     MetadynamicsReporter('HILLS', hills_write_pace)
 )
 
+# Compute initial c(t) for both CVs (before simulation)
+print(f"Initial c(t) for phi: {compute_ct_1d(meta, 0):.4f}")
+print(f"Initial c(t) for psi: {compute_ct_1d(meta, 1):.4f}")
+
 meta.step(simulation, total_steps)
 
+# Compute final c(t) for both CVs (after simulation)
+print(f"Final c(t) for phi: {compute_ct_1d(meta, 0):.4f}")
+print(f"Final c(t) for psi: {compute_ct_1d(meta, 1):.4f}")
+
 # Plot CV time series
-df_cv = pd.read_csv('HILLS', delimiter='\s+', skiprows=7, header=None)
+df_cv = pd.read_csv('HILLS', delimiter=r'\s+', skiprows=7, header=None)
 df_cv.columns = ['time(ps)', 'cv0', 'cv1', 'sigma_cv0', 'sigma_cv1', 'hill_height', 'bias_factor']
 
 # Create subplots
