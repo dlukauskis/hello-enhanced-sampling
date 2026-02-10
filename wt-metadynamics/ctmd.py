@@ -15,7 +15,12 @@ __version__ = "0.1.0"
 __email__ = "lukauskisdominykas@gmail.com"
 
 
-def main(args):
+def main(structure = '../benchmark_systems/bCD-G1/system.gro',
+         parameters = '../benchmark_systems/bCD-G1/system.top',
+         output = 'tmp',
+         lig_resname = 'GST',
+         nreps = 1,
+         hill_height = 0.416666667):
     """
     args.structure : str, default='solvated.rst7'
         Name of the structure file, either Amber or Gromacs format.
@@ -31,28 +36,30 @@ def main(args):
     args.hill_height : float, default=0.3
         Size of the metadynamical hill, in kcal/mol.
     """
-    if args.structure.endswith('.gro'):
-        coords = GromacsGroFile(args.structure)
+    if structure.endswith('.gro'):
+        coords = GromacsGroFile(structure)
         box_vectors = coords.getPeriodicBoxVectors()
-        parm = GromacsTopFile(args.parameters, periodicBoxVectors=box_vectors)
+        parm = GromacsTopFile(parameters, periodicBoxVectors=box_vectors)
     else:
-        coords = AmberInpcrdFile(args.structure)
-        parm = AmberPrmtopFile(args.parameters)
+        coords = AmberInpcrdFile(structure)
+        parm = AmberPrmtopFile(parameters)
 
-    if not os.path.isdir(f'{args.output}'):
-        os.mkdir(f'{args.output}')
+    if not os.path.isdir(f'{output}'):
+        os.mkdir(f'{output}')
 
     # Run NREPS number of production simulations
-    for idx in range(0, args.nreps):
-        rep_dir = os.path.join(args.output, f'rep_{idx}')
+    for idx in range(0, nreps):
+        rep_dir = os.path.join(output, f'rep_{idx}')
         if not os.path.isdir(rep_dir):
             os.mkdir(rep_dir)
 
         if os.path.isfile(os.path.join(rep_dir, 'ctmd_results.csv')):
             continue
 
-        produce(args.output, idx, args.lig_resname, coords, parm, args.parameters,
-                args.structure, 0.416666667, anchor_atom_lst=[])
+        produce(
+            coords, parm, output, idx, lig_resname, hill_height,
+            anchor_atom_lst=[0,21,42,63,84,105,126],
+        )
 
 
     return None
@@ -90,8 +97,7 @@ def compute_ct(s_grid, V_bias, beta, gamma):
     return c_t
 
 
-def produce(out_dir, idx, lig_resname, input_pos, parm, parm_file,
-            coords_file, set_hill_height, anchor_atom_lst: list = []):
+def produce(input_pos, parm, out_dir, idx, lig_resname, set_hill_height, anchor_atom_lst: list = []):
     """An CTMD production simulation function. Ligand RMSD is biased with
     wt-metadynamics. The integrator uses a 4 fs time step and
     runs for 5 ns, writing a frame every 100 ps.
@@ -103,39 +109,34 @@ def produce(out_dir, idx, lig_resname, input_pos, parm, parm_file,
 
     Parameters
     ----------
+    input_pos : AmberInpcrdFile or GromacsGroFile object
+        Name of the PDB for equilibrated system.
+    parm : Parmed or OpenMM parameter file object
+        Used to create the OpenMM System object.
     out_dir : str
         Directory where your equilibration PDBs and 'rep_*' dirs are at.
     idx : int
         Current replica index.
     lig_resname : str
         Residue name of the ligand.
-    input_pos : AmberInpcrdFile or GromacsGroFile object
-        Name of the PDB for equilibrated system.
-    parm : Parmed or OpenMM parameter file object
-        Used to create the OpenMM System object.
-    parm_file : str
-        The name of the parameter or topology file of the system.
     set_hill_height : float
         Metadynamic hill height, in kcal/mol.
     anchor_atom_lst : list, default=[]
         List of atom indices to use as anchor atoms for the RMSD calculation.
-         If empty, the function will automatically select heavy backbone atoms
-         within 10 angstroms of the protein's center of mass as anchor atoms.
     """
     # First, assign the replica directory to which we'll write the files
     write_dir = os.path.join(out_dir, f'rep_{idx}')
 
     lig_ha_lst = [
-        atom.index for atom in topology.atoms()
+        atom.index for atom in parm.topology.atoms()
         if atom.residue.name == lig_resname and not atom.name.startswith("H")
     ]
 
     # Set up the system to run metadynamics
     system = parm.createSystem(
-        nonbondedMethod=PME,
-        nonbondedCutoff=1 * nanometer,
+        nonbondedMethod=NoCutoff,
         constraints=HBonds,
-        hydrogenMass=4 * amu
+        hydrogenMass=4 * amu,
     )
     # get the atom positions for the system from the equilibrated
     # system
@@ -171,16 +172,18 @@ def produce(out_dir, idx, lig_resname, input_pos, parm, parm_file,
                            False, gridWidth=grid)
 
     # define the metadynamics object
-    # deposit bias every 1 ps, BF = 4, write bias every ns
-    meta = Metadynamics(system, [rmsd_cv], 300.0 * kelvin, 10.0, hill_height,
-                        250, biasDir=write_dir,
-                        saveFrequency=250000)
+    # deposit bias every 1 ps, BF = 10, write bias every ns
+    meta = Metadynamics(
+        system, [rmsd_cv], 300.0 * kelvin, 10.0, hill_height,250,
+        biasDir=write_dir, saveFrequency=250000
+    )
 
     # Set up and run metadynamics
     integrator = LangevinIntegrator(300 * kelvin, 1.0 / picosecond,
                                     0.004 * picosecond)
-    platform = Platform.getPlatformByName('CUDA')
-    properties = {'CudaPrecision': 'mixed'}
+    platform = Platform.getPlatformByName('CPU')
+    # properties = {'CudaPrecision': 'mixed'}
+    properties = {}
 
     simulation = Simulation(parm.topology, system, integrator, platform,
                             properties)
@@ -200,10 +203,15 @@ def produce(out_dir, idx, lig_resname, input_pos, parm, parm_file,
 
     colvar_array = np.array([meta.getCollectiveVariables(simulation)])
     # calculate the c(t) as described in Eq 1. of https://www.biorxiv.org/content/10.64898/2026.02.05.703972v1.full.pdf
-    c_t = compute_ct(meta._grid, meta._bias, 1 / (0.008314 * 300), meta._biasFactor)
+
+    # Create grid for 1D bias
+    cv = meta.variables[0]  # RMSD is the only CV
+    s_grid = np.linspace(cv.minValue, cv.maxValue, meta._totalBias.shape[0])
+
+    c_t = compute_ct(s_grid, meta._totalBias, 1 / (0.008314 * 300), meta.biasFactor)
     print(f"Initial c(t): {c_t:.2f} kJ/mol")
     for i in range(0, int(steps), 500):
-        c_t = compute_ct(meta._grid, meta._bias, 1 / (0.008314 * 300), meta._biasFactor)
+        c_t = compute_ct(s_grid, meta._totalBias, 1 / (0.008314 * 300), meta.biasFactor)
         print(f"step {i}: c(t): {c_t:.2f} kJ/mol")
         if i % 25000 == 0:
             # log the stored COLVAR every 100ps
@@ -215,3 +223,7 @@ def produce(out_dir, idx, lig_resname, input_pos, parm, parm_file,
     np.save(os.path.join(write_dir, 'COLVAR.npy'), colvar_array)
 
     return None
+
+
+if __name__ == '__main__':
+    main()
