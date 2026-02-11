@@ -5,7 +5,7 @@ from openmm.app import *
 from openmm.unit import kelvin, kilojoules_per_mole, picosecond
 from metadynamics import Metadynamics, BiasVariable
 from metadynamicsreporter import MetadynamicsReporter
-from ctmd import compute_ct
+from run_ctmd import compute_ct
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd

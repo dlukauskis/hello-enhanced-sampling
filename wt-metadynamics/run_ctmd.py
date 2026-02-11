@@ -1,4 +1,25 @@
 #!/usr/bin/env python
+"""
+This script runs a well-tempered metadynamics simulation using OpenMM, and computes the c(t) value at certain pace.
+The c(t) value is computed using the formula from the paper "Early-Enrichment Hit Discovery via
+Reversible-Work c(t) Estimation in Metadynamics (CTMD)" (https://www.biorxiv.org/content/10.64898/2026.02.05.703972v1.full.pdf).
+
+The test system is a beta-cyclodextrin host-guest system, where the CV is the RMSD of the ligand heavy atoms to a reference
+structure. The script runs in vacuo for testing purposes, but can be easily adapted to run in explicit solvent by changing the
+input files the system creation parameters.
+
+structure : str
+    Name of the structure file, either Amber or Gromacs format.
+parameters : str
+    Name of the parameter or topology file, either Amber or Gromacs
+    format.
+output : str
+    Path to and the name of the output directory.
+lig_resname
+    Residue name of the ligand in the structure/parameter file.
+hill_height : float, default=1.75
+    Size of the metadynamical hill, in kJ/mol.
+"""
 
 # OpenMM
 from openmm import *
@@ -45,28 +66,14 @@ def compute_ct(s_grid, V_bias, beta, gamma):
 
     return c_t
 
-"""
-structure : str
-    Name of the structure file, either Amber or Gromacs format.
-parameters : str
-    Name of the parameter or topology file, either Amber or Gromacs
-    format.
-output : str
-    Path to and the name of the output directory.
-lig_resname
-    Residue name of the ligand in the structure/parameter file.
-hill_height : float, default=1.75
-    Size of the metadynamical hill, in kJ/mol.
-"""
-
 structure = '../benchmark_systems/bCD-G1/system.gro'
 parameters = '../benchmark_systems/bCD-G1/system.top'
-out_dir_name, idx = 'tmp', 0
+out_dir_name, idx = 'test_ctmd', 0  # run extra replicas by incrementing idx
 lig_resname = 'GST'
-set_hill_height = 1.75
+set_hill_height = 1.75  # kJ/mol, described in the pre-print
 anchor_atom_lst = [0,21,42,63,84,105,126]  # for proteins, this can be the CA atoms near protein CoG
 in_vacuo = True  # only for testing purposes with the host-guest system
-sim_time = 5  # ns
+sim_time = 5  # ns, again as from the preprint
 deposition_pace = 250  # deposit a hill every 1 ps, so 250 steps with a 4 fs timestep
 
 
@@ -191,7 +198,8 @@ for i in range(0, int(total_steps), deposition_pace):
     # record the CVs every 1 ps
     colvar_array = np.vstack([colvar_array, np.array([current_cv, c_t])])
 
-    # if more than 200 ps are spent above 6 angstroms, stop the simulation according to protocol
+    # if more than 200 ps are spent above 6 angstroms, stop the simulation
+    # according to the protocol
     if ps_spent_above_6_ang > 200:
         break
 

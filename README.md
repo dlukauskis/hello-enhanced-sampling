@@ -1,5 +1,14 @@
 # hello-enhanced-sampling
-Repository of scripts and recipes for testing and analysing various enhanced sampling approaches in MD.
+Repository of OpenMM scripts and recipes for testing and analysing various enhanced sampling approaches in MD on a few toy systems:
+- Alanine dipeptide in vacuum
+- Beta cyclodextrin in vacuum
+
+Current enhanced sampling approaches tested:
+- Well-tempered metadynamics
 
 ## Dependencies
-install pandas numpy matplotlib openmm via conda.
+
+Replicate my environment using the `environment.yml` file:
+```commandline
+conda env create -f environment.yml
+```
