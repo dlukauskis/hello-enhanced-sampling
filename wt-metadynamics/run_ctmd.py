@@ -66,6 +66,38 @@ def compute_ct(s_grid, V_bias, beta, gamma):
 
     return c_t
 
+
+# Helper function to marginalize 2D bias to 1D and compute c(t)
+def compute_ct_1d(meta, cv_index):
+    """Marginalize 2D bias to 1D along specified CV and compute c(t)
+
+    Proper marginalization: P(s_i) = integral of exp(-beta*V(s_i, s_j)) ds_j
+    This requires taking the minimum free energy along the other dimension
+
+    Example use, getting c(t) for CV0:
+    ct_cv0 = compute_ct_1d(meta, 0)
+    """
+    beta = 1 / (0.008314 * 300)
+    bias_2d = meta._totalBias
+
+    # Marginalize: take minimum along the other CV axis
+    # (Free energy = -1/beta * log(integral of exp(-beta*V)))
+    if cv_index == 0:
+        # Marginalize over CV1 (psi), keeping CV0 (phi)
+        # Find minimum free energy along psi for each phi value
+        bias_1d = np.min(bias_2d, axis=1)
+    else:
+        # Marginalize over CV0 (phi), keeping CV1 (psi)
+        # Find minimum free energy along phi for each psi value
+        bias_1d = np.min(bias_2d, axis=0)
+
+    # Create grid for the marginalized CV
+    cv = meta.variables[cv_index]
+    s_grid = np.linspace(cv.minValue, cv.maxValue, len(bias_1d))
+
+    return compute_ct(s_grid, bias_1d, beta, meta.biasFactor)
+
+
 structure = '../benchmark_systems/bCD-G1/system.gro'
 parameters = '../benchmark_systems/bCD-G1/system.top'
 out_dir_name, idx = 'test_ctmd', 0  # run extra replicas by incrementing idx
