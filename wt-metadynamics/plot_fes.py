@@ -7,7 +7,7 @@ if __name__ == '__main__':
     # Read HILLS file
     save_fes = False
     fes_1d = True
-    stride = 1
+    stride = 500
     clip_fes_to = 50 # kJ/mol, for better visualization
 
     filename = 'HILLS'
@@ -28,20 +28,23 @@ if __name__ == '__main__':
         periodic_cv1=True,
         stride=stride,
     )
-    # print(fes_arr.shape)  # should be (n_snapshots, grid_points, grid_points)
-    if stride == 1:
+    if not stride:
         fes = fes_arr[-1]
     # Reconstruct 1D FES
     if fes_1d:
         # Project along phi (integrate out psi)
-        if stride > 1:
-            # TODO: UNFINISHED - do this properly, plotting each 1D FES on the same figure
+        if stride:
+            phi_grid_lst, fes_phi_lst = [], []
             for fes in fes_arr:
                 phi_grid, fes_phi = project_fes_1d(cv0_grid, cv1_grid, fes,
                                                    kT=2.494,  # 300K in kJ/mol
                                                    project_along='cv0')
-                # get these to plot in the same figure, with a label for each curve
-                plot_fes_1d(phi_grid, fes_phi, max_energy=clip_fes_to, save_plot=False)
+                phi_grid_lst.append(phi_grid)
+                fes_phi_lst.append(fes_phi)
+            print(f"Projected 1D FES shape: {phi_grid.shape} {fes_phi.shape}")
+            print(f"Types: {type(phi_grid)} {type(fes_phi)}")
+            # get these to plot in the same figure, with a label for each curve
+            plot_fes_1d(phi_grid_lst, fes_phi_lst, max_energy=clip_fes_to, save_plot=False)
         else:
             phi_grid, fes_phi = project_fes_1d(cv0_grid, cv1_grid, fes,
                                                kT=2.494,  # 300K in kJ/mol

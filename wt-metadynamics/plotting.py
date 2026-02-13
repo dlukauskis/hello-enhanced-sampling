@@ -25,17 +25,34 @@ def plot_fes_2d(cv0_grid, cv1_grid, fes, max_energy=None, save_plot=False):
     plt.show()
 
 
-def plot_fes_1d(grid, fes_1d: list | np.ndarray, label='CV (rad)', max_energy=50, save_plot=False, filename='fes_1d.png'):
+def plot_fes_1d(
+        grid: list | np.ndarray,
+        fes_1d: list | np.ndarray,
+        label='CV (rad)',
+        max_energy=50,
+        save_plot=False,
+        filename='fes_1d.png'
+):
     """Plot 1D free energy profile."""
-    # if type(fes_1d) is list:
 
     if max_energy is not None:
-        fes_plot = np.clip(fes_1d, 0, max_energy)
+        if type(fes_1d) is list:
+            fes_plot = []
+            for fes in fes_1d:
+                cliped_fes_1d = np.clip(fes, 0, max_energy)
+                fes_plot.append(cliped_fes_1d)
+        else:
+            fes_plot = np.clip(fes_1d, 0, max_energy)
     else:
         fes_plot = fes_1d
 
     plt.figure(figsize=(10, 6))
-    plt.plot(grid, fes_plot, 'b-', linewidth=2)
+    if type(fes_plot) is list:
+        for i, fes in enumerate(fes_plot):
+            plt.plot(grid[i], fes, label=f'Snapshot {i+1}', linewidth=2)
+        plt.legend()
+    else:
+        plt.plot(grid, fes_plot, 'b-', linewidth=2)
     plt.xlabel(label, fontsize=12)
     plt.ylabel('Free Energy (kJ/mol)', fontsize=12)
     plt.title('1D Free Energy Profile', fontsize=14)

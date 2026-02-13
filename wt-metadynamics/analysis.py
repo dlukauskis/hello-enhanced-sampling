@@ -70,16 +70,16 @@ def gaussian_2d(
 def reconstruct_fes(
         cv0_centers, cv1_centers, sigma_cv0, sigma_cv1, heights,
         bounds, grid_points=200, periodic_cv0=False, periodic_cv1=False,
-        stride=1,
+        stride=None,
 ):
     """Reconstruct FES progressively, computing snapshots every
     'stride' hills.
 
     Parameters:
     -----------
-    stride : int
+    stride : int | None
         Compute FES every 'stride' hills (e.g., stride=10 gives FES
-        at hills 10, 20, 30, ...)
+        at hills 10, 20, 30, ...). If not provided, use all hills.
 
     Returns:
     --------
@@ -107,7 +107,10 @@ def reconstruct_fes(
     fes_snapshots = []
 
     n_hills = len(cv0_centers)
-    print(f"Computing FES snapshots every {stride} hills (total {n_hills} hills)...")
+    if stride is None:
+        stride = n_hills  # Only compute final FES after all hills
+    else:
+        print(f"Computing FES snapshots every {stride} hills (total {n_hills} hills)...")
 
     for i in range(n_hills):
         bias += gaussian_2d(
