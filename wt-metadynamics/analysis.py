@@ -23,6 +23,7 @@ def read_hills_file(filename):
     data = np.loadtxt(filename, comments=['#', '!'])
 
     # Extract columns: time, cv0, cv1, sigma_cv0, sigma_cv1, height, biasf
+    time = data[:, 0]
     cv0_centers = data[:, 1]
     cv1_centers = data[:, 2]
     sigma_cv0 = data[:, 3]
@@ -36,7 +37,7 @@ def read_hills_file(filename):
         'max_cv1': max_cv1
     }
 
-    return cv0_centers, cv1_centers, sigma_cv0, sigma_cv1, heights, bounds
+    return time, cv0_centers, cv1_centers, sigma_cv0, sigma_cv1, heights, bounds
 
 
 def periodic_distance(x, x0, period):

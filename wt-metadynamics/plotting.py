@@ -17,8 +17,8 @@ def plot_fes_2d(cv0_grid, cv1_grid, fes, max_energy=None, save_plot=False):
     plt.contour(cv0_grid, cv1_grid, fes_plot, levels=10, colors='white',
                 linewidths=0.5, alpha=0.5)
 
-    plt.xlabel('CV0 (rad)')
-    plt.ylabel('CV1 (rad)')
+    plt.xlabel('CV0 (units)')
+    plt.ylabel('CV1 (units)')
     plt.title('Free Energy Surface')
     plt.tight_layout()
     if save_plot:
