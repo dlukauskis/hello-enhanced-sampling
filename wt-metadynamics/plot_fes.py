@@ -1,17 +1,15 @@
 import numpy as np
 from analysis import read_hills_file, reconstruct_fes, project_fes_1d
-from plotting import plot_fes_2d, plot_fes_1d, plot_deltaF_over_time
 import matplotlib.pyplot as plt
 
-# Main execution
-if __name__ == '__main__':
+
+def main(
+    filename = 'HILLS',
+    stride = 500,
+    clip_fes_to = 50,  # kJ/mol, for better visualization
+    fig_fname = None,
+):
     # Read HILLS file
-    save_fes = False
-    stride = 500
-    clip_fes_to = 50 # kJ/mol, for better visualization
-
-    filename = 'HILLS'
-
     time_ps, cv0_arr, cv1_arr, sigma_cv0, sigma_cv1, heights, bounds = read_hills_file(filename)
 
     print(f"Read {len(cv0_arr)} hills from {filename}")
@@ -31,7 +29,6 @@ if __name__ == '__main__':
 
     # make one figure with 4 subplots:
     # (1) CVs over time, (2) FES heatmap, (3) 1D FES (projected along phi) and (4) deltaF over time
-
     fig, axes = plt.subplots(2, 2, figsize=(12, 12), constrained_layout=True)
     ax0, ax1, ax2, ax3 = axes.flatten()
 
@@ -70,13 +67,13 @@ if __name__ == '__main__':
     # (3) plot 1D FES, with one curve for each snapshot/stride interval
     ax2.set_title('1D Free Energy Profile (Projected Along Phi)', fontsize=12)
     for i, fes_1d in enumerate(fes_phi_lst):
-        ax2.plot(phi_grid_lst[i], fes_1d, label=f'Hills {stride*i}-{stride*(i+1)}', linewidth=2)
+        ax2.plot(phi_grid_lst[i], fes_1d, label=f'Hills {stride * i}-{stride * (i + 1)}', linewidth=2)
     ax2.legend()
     ax2.set_xlabel('CV (rad)', fontsize=10)
     ax2.set_ylabel('Free Energy (kJ/mol)', fontsize=10)
     ax2.set_title('1D Free Energy Profile', fontsize=12)
 
-    # plot deltaF over time
+    # (4) plot deltaF over time
     ax3.plot(np.arange(len(delta_F_lst)) * stride, delta_F_lst, 'r-', linewidth=2,
              label=f'final ΔF = {delta_F_lst[-1]:.2f} kJ/mol)')
     ax3.legend()
@@ -84,4 +81,11 @@ if __name__ == '__main__':
     ax3.set_ylabel('ΔF (kJ/mol)', fontsize=10)
     ax3.set_title('Free Energy Difference Between Alpha and Beta Basins', fontsize=12)
 
+    if fig_fname:
+        plt.savefig(fig_fname)
     plt.show()
+
+
+# Main execution
+if __name__ == '__main__':
+    main()

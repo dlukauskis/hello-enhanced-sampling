@@ -1,11 +1,13 @@
 from sys import stdout
 
+import numpy as np
 from openmm import *
 from openmm.app import *
 from openmm.unit import kelvin, kilojoules_per_mole, picosecond
+
 from metadynamics import Metadynamics, BiasVariable
 from metadynamicsreporter import MetadynamicsReporter
-import numpy as np
+from plot_fes import main as plot_fes
 
 
 # Simulation parameters
@@ -14,6 +16,8 @@ total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings
 hills_pace = 500
 hills_write_pace = 500
 bias_f = 6
+# res_fig_fname = 'aladipep-results.png'  # if you want a results plot, save it
+res_fig_fname = ''
 
 
 # Create a System for alanine dipeptide in vacuo
@@ -59,3 +63,6 @@ meta.reporters.append(
 )
 
 meta.step(simulation, total_steps)
+
+# show a plot of the important metrics and results
+plot_fes('HILLS', stride=500, fig_fname=res_fig_fname)

@@ -1,4 +1,3 @@
-import matplotlib.pyplot
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -69,10 +68,10 @@ def plot_fes_1d(
         plt.savefig(filename, dpi=300)
     plt.show()
 
-def plot_deltaF_over_time(delta_F_lst, stride=500, save_plot=False, filename='deltaF_over_time.png'):
+def plot_deltaf_over_time(delta_f_lst, stride=500, save_plot=False, filename='deltaF_over_time.png'):
     """Plot the free energy difference between alpha and beta basins over time."""
     plt.figure(figsize=(10, 6))
-    plt.plot(np.arange(len(delta_F_lst)) * stride, delta_F_lst, 'r-', linewidth=2)
+    plt.plot(np.arange(len(delta_f_lst)) * stride, delta_f_lst, 'r-', linewidth=2)
     plt.xlabel('Time (ps)', fontsize=12)
     plt.ylabel('ΔF (kJ/mol)', fontsize=12)
     plt.title('Free Energy Difference Between Alpha and Beta Basins Over Time', fontsize=14)
