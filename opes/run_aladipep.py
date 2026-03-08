@@ -2,12 +2,13 @@ from sys import stdout
 
 from openmm import *
 from openmm.app import *
-from openmm.unit import *
+from openmm.unit import kelvin, kilojoules_per_mole, picosecond, radian
 import opes
 import numpy as np
+import os
 
-# total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings
-total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings
+total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings
+# total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings
 hills_pace = 500
 hills_write_pace = 500
 
@@ -25,12 +26,8 @@ system = forcefield.createSystem(
 # Define collective variables for phi and psi.
 cv1 = CustomTorsionForce('theta')
 cv1.addTorsion(4, 6, 8, 14)
-# sigma_cv0 = 0.35
-# phi = BiasVariable(cv1, -np.pi, np.pi, sigma_cv0, True)
 cv2 = CustomTorsionForce('theta')
 cv2.addTorsion(6, 8, 14, 16)
-# sigma_cv1 = 0.35
-# psi = BiasVariable(cv2, -np.pi, np.pi, sigma_cv1, True)
 
 # Create OPES bias
 opes_bias = opes.OPES(
@@ -40,7 +37,9 @@ opes_bias = opes.OPES(
     barrier=10 * kilojoules_per_mole,
     sigma=[0.35 * radian, 0.35 * radian],
     stride=hills_pace,
-    biasDir='opes_output'
+    biasDir='output',
+    periodic=[(-np.pi, np.pi), (-np.pi, np.pi)],  # Both phi and psi are periodic!
+    initial_height=1.2,  # kJ/mol
 )
 
 # Run simulation
@@ -60,7 +59,10 @@ simulation.reporters.append(StateDataReporter(
 # Run with OPES
 opes_bias.step(simulation, total_steps)
 
-
 # Extract free energy
 cv_grid = [np.linspace(-3.14, 3.14, 200), np.linspace(-3.14, 3.14, 200)]
 fes = opes_bias.getFreeEnergy(cv_grid)
+
+# save fes for later analysis
+fes_out_fpath = os.path.join('results', 'opes_output_fes.npz')
+np.savez_compressed(fes_out_fpath, fes=fes, grid0=cv_grid[0], grid1=cv_grid[1])
