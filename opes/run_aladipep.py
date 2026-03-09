@@ -6,11 +6,12 @@ from openmm.unit import kelvin, kilojoules_per_mole, picosecond, radian
 import opes
 import numpy as np
 import os
+from opes.opes_reporter import OPEsCVReporter
 
-total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings
-# total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings
-hills_pace = 500
-hills_write_pace = 500
+# total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings
+total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings
+kernel_pace = 500
+stride = 500
 
 
 # Create a System for alanine dipeptide in vacuo
@@ -36,10 +37,10 @@ opes_bias = opes.OPES(
     temperature=300 * kelvin,
     barrier=10 * kilojoules_per_mole,
     sigma=[0.35 * radian, 0.35 * radian],
-    stride=hills_pace,
+    stride=kernel_pace,
+    saveFrequency=stride,
     biasDir='output',
     periodic=[(-np.pi, np.pi), (-np.pi, np.pi)],  # Both phi and psi are periodic!
-    initial_height=1.2,  # kJ/mol
 )
 
 # Run simulation
@@ -48,6 +49,12 @@ integrator = LangevinIntegrator(
 )
 simulation = Simulation(pdb_file.topology, system, integrator)
 simulation.context.setPositions(pdb_file.positions)
+
+# add CV reporter
+os.makedirs(opes_bias.biasDir, exist_ok=True)
+cv_report_file = os.path.join(opes_bias.biasDir, 'cv_history.txt')
+cv_reporter = OPEsCVReporter(cv_report_file, kernel_pace, opes_bias)
+simulation.reporters.append(cv_reporter)
 
 simulation.reporters.append(StateDataReporter(
     stdout, 50000, step=True,
@@ -66,3 +73,7 @@ fes = opes_bias.getFreeEnergy(cv_grid)
 # save fes for later analysis
 fes_out_fpath = os.path.join('results', 'opes_output_fes.npz')
 np.savez_compressed(fes_out_fpath, fes=fes, grid0=cv_grid[0], grid1=cv_grid[1])
+
+# save kernels and cv history
+if opes_bias.biasDir:
+    opes_bias.saveKernels()

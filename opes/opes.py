@@ -22,7 +22,8 @@ import numpy as np
 import os
 from openmm import CustomCVForce
 from openmm import unit
-from openmm.unit import kilojoules_per_mole, nanometer, radian
+# use unit.kilojoules_per_mole, unit.nanometer, unit.radian explicitly to avoid
+# static-analysis name resolution issues
 
 
 class OPES:
@@ -59,9 +60,6 @@ class OPES:
     max_kernels : int or None
         Optional cap on number of kernels (old kernels will be dropped when
         exceeded).
-    initial_height : float or openmm.unit.Quantity, optional
-        Fixed height for deposited kernels (in kJ/mol). If provided, all kernels
-        will have this height, ignoring the automatic height computation.
     """
 
     def __init__(
@@ -69,7 +67,7 @@ class OPES:
         system,
         variables,
         temperature,
-        barrier=10 * kilojoules_per_mole,
+        barrier=10 * unit.kilojoules_per_mole,
         sigma=None,
         stride=500,
         compression_threshold=1.0,
@@ -78,7 +76,7 @@ class OPES:
         periodic=None,
         rebuild_every=10,
         max_kernels=None,
-        initial_height=None,  # optional fixed kernel height in kJ/mol (float or Quantity)
+        capacity=5000,
     ):
         self.system = system
         self.variables = variables
@@ -98,7 +96,7 @@ class OPES:
         kB = unit.BOLTZMANN_CONSTANT_kB * unit.AVOGADRO_CONSTANT_NA
         kT_quantity = kB * temperature
         # numeric kT in kJ/mol (float)
-        self.kT = kT_quantity.value_in_unit(kilojoules_per_mole)
+        self.kT = kT_quantity.value_in_unit(unit.kilojoules_per_mole)
         self.beta = 1.0 / self.kT
 
         self.barrier = barrier
@@ -108,21 +106,21 @@ class OPES:
         self.biasDir = biasDir
         self.rebuild_every = max(1, int(rebuild_every))
         self.max_kernels = None if max_kernels is None else int(max_kernels)
-        # Optional fixed kernel height (numeric in kJ/mol). If provided, each
-        # deposited kernel will have this height. Useful for testing / matching
-        # wt-metadynamics behavior. If a Quantity is passed, convert to kJ/mol.
-        if initial_height is None:
-            self.initial_height = None
-        else:
-            if hasattr(initial_height, 'unit'):
-                self.initial_height = float(initial_height.value_in_unit(kilojoules_per_mole))
-            else:
-                self.initial_height = float(initial_height)
+        # When capacity is provided, pre-allocate parameterized kernel slots
+        # and never rebuild the force expression; this allows fast updates via
+        # CustomCVForce global parameters and updateParametersInContext(). If
+        # capacity is None or 0, fall back to the previous dynamic-expression
+        # behavior.
+        self.capacity = None if capacity is None else int(capacity)
+
+        # CV tracking is delegated to an external reporter (OPEsCVReporter).
+        # Previously we stored CVs in-memory; that has been removed to mirror
+        # the wt-metadetics approach (separate reporter class).
 
         # Kernel widths: accept single sigma or list
         if sigma is None:
             # Default sigma: assume angular CVs (radian) for safety
-            sigma = [0.1 * radian] * self.num_cvs
+            sigma = [0.1 * unit.radian] * self.num_cvs
         if not hasattr(sigma, '__iter__') or isinstance(sigma, unit.Quantity):
             sigma = [sigma] * self.num_cvs
         if len(sigma) != self.num_cvs:
@@ -137,10 +135,10 @@ class OPES:
             if hasattr(s, 'unit'):
                 # choose radian when periodic range is given (angles)
                 if self.periodic[i] is not None:
-                    val = s.value_in_unit(radian)
+                    val = s.value_in_unit(unit.radian)
                 else:
                     # assume distance-like CV
-                    val = s.value_in_unit(nanometer)
+                    val = s.value_in_unit(unit.nanometer)
             else:
                 # bare float: assume already in correct units
                 val = float(s)
@@ -152,10 +150,13 @@ class OPES:
         self.kernel_counter = 0
 
         # OPES-specific epsilon (numeric)
-        self.epsilon = math.exp(-self.barrier.value_in_unit(kilojoules_per_mole) / self.kT)
+        self.epsilon = math.exp(-self.barrier.value_in_unit(unit.kilojoules_per_mole) / self.kT)
 
         # Create the bias force and add to the system
         self._createBiasForce()
+        # If capacity mode is enabled, initialize parameter slots in the force
+        if self.capacity and self.capacity > 0:
+            self._init_parameter_slots()
 
         # Statistics
         self.step_count = 0
@@ -164,6 +165,7 @@ class OPES:
         """Create the CustomCVForce for OPES bias and register CVs."""
 
         # initial zero energy expression
+        # We'll set an expression later depending on whether capacity mode is used
         self.force = CustomCVForce("0")
 
         # Add collective variables (each variable object is passed directly)
@@ -175,6 +177,60 @@ class OPES:
         self.force.setForceGroup(15)
         self.system.addForce(self.force)
 
+    def _init_parameter_slots(self):
+        """Pre-allocate global parameters for kernel slots and set a fixed
+        energy expression that sums over these slots. This avoids rebuilding
+        the expression when adding kernels; only global parameters change.
+        """
+        N = self.capacity
+        # Build expression: sum over k terms of a_k * h_k * G_k * exp(beta*Z_k)
+        # where G_k is the multivariate Gaussian built from cv differences.
+        kernel_terms = []
+        for k in range(N):
+            gaussian_terms = []
+            for j in range(self.num_cvs):
+                # parameter names
+                c = f"c_{k}_{j}"
+                # periodic handling via cvj and center parameter
+                if self.periodic[j] is None:
+                    diff = f"(cv{j}-{c})"
+                else:
+                    pmin, pmax = self.periodic[j]
+                    period = pmax - pmin
+                    diff = (
+                        f"((cv{j}-{c})-{period}*floor(((cv{j}-{c})/{period})+0.5))"
+                    )
+                gaussian_terms.append(f"(pow({diff},2)/{(self.sigma_vals[j] ** 2):.12g})")
+
+            G = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
+            # parameters: active a_k, height h_k, Z_k
+            a = f"a_{k}"
+            h = f"h_{k}"
+            Z = f"Z_{k}"
+            kernel_terms.append(f"({a}*{h}*{G}*exp({self.beta:.12g}*{Z}))")
+
+        sum_kernels = "+".join(kernel_terms) if kernel_terms else "0"
+        bias_expr = f"-{float(self.kT):.12g}*log(1.0+({sum_kernels}))"
+
+        # set the energy function once
+        self.force.setEnergyFunction(bias_expr)
+
+        # add global parameters with sensible defaults (disabled)
+        for k in range(N):
+            # centers for each CV
+            for j in range(self.num_cvs):
+                self.force.addGlobalParameter(f"c_{k}_{j}", 0.0)
+            # height, Z, active flag
+            self.force.addGlobalParameter(f"h_{k}", 0.0)
+            self.force.addGlobalParameter(f"Z_{k}", 0.0)
+            self.force.addGlobalParameter(f"a_{k}", 0.0)
+
+        # bookkeeping for slot management
+        self.next_slot = 0  # next slot to write into
+        self.active_slots = 0
+        # mapping from logical kernel index to slot assigned (for saving/dropping)
+        self.slot_kernel_map = []
+
     def _updateBiasExpression(self):
         """Update the bias energy expression based on current kernels.
 
@@ -183,6 +239,9 @@ class OPES:
         additions.
         """
 
+        if self.capacity and self.capacity > 0:
+            # In capacity mode the expression is fixed by `_init_parameter_slots`.
+            return
         if len(self.kernels) == 0:
             self.force.setEnergyFunction("0")
             return
@@ -335,38 +394,76 @@ class OPES:
                 # Compute Z value
                 Z = self._computeZ(cv_values)
 
-                # Compute kernel height (simple heuristic)
-                if self.initial_height is not None:
-                    height = float(self.initial_height)
-                else:
-                    N_eff = len(self.kernels)
-                    height = float(self.epsilon / (1.0 + N_eff))
+                # Compute kernel height using the canonical OPES rule (Invernizzi & Parrinello):
+                #   h = kT * ln(1 + epsilon / p_est(s))
+                # where p_est(s) is the current estimated probability (unnormalized) at the CV point.
+                # We have Z = -bias/kT, so p_est_unnorm = exp(Z). Epsilon is exp(-barrier/kT).
+                # Add a tiny floor to p_est to avoid division by zero.
+                tiny = 1e-300
+                p_est = math.exp(Z)
+                if not np.isfinite(p_est) or p_est <= 0.0:
+                    p_est = tiny
+                height = float(self.kT * math.log(1.0 + (self.epsilon / p_est)))
 
                 # Store kernel as numeric list
                 kernel = [float(x) for x in cv_values] + [height, float(Z)]
 
-                # Enforce max_kernels if requested
-                if (self.max_kernels is not None) and (len(self.kernels) >= self.max_kernels):
-                    # drop oldest kernel
-                    self.kernels.pop(0)
+                # If capacity mode is active, write into the next global-parameter slot
+                if self.capacity and self.capacity > 0:
+                    slot = self.next_slot
+                    # set center parameters
+                    for j in range(self.num_cvs):
+                        pname = f"c_{slot}_{j}"
+                        self.force.setGlobalParameterDefaultValue(pname, float(cv_values[j]))
+                    # set height and Z, enable slot
+                    self.force.setGlobalParameterDefaultValue(f"h_{slot}", float(height))
+                    self.force.setGlobalParameterDefaultValue(f"Z_{slot}", float(Z))
+                    self.force.setGlobalParameterDefaultValue(f"a_{slot}", 1.0)
 
-                self.kernels.append(kernel)
-                self.kernel_counter += 1
-
-                # Compress occasionally
-                if (self.kernel_counter % 100) == 0:
-                    self._compressKernels()
-
-                # Rebuild bias expression and reinitialize context only every rebuild_every
-                if (self.kernel_counter % self.rebuild_every) == 0:
-                    self._updateBiasExpression()
-                    # Attempt to update parameters in context; if not possible,
-                    # reinitialize to ensure the new expression is used.
+                    # update the context with new parameter defaults (fast)
                     try:
                         self.force.updateParametersInContext(simulation.context)
                     except Exception:
-                        # as a fallback, reinitialize preserving state
+                        # if update fails, fallback to reinitialization
                         simulation.context.reinitialize(preserveState=True)
+
+                    # bookkeeping
+                    self.slot_kernel_map.append(kernel)
+                    self.next_slot = (self.next_slot + 1) % self.capacity
+                    self.active_slots = min(self.capacity, self.active_slots + 1)
+                    self.kernel_counter += 1
+
+                    # Enforce max_kernels by disabling oldest slot if needed
+                    if (self.max_kernels is not None) and (len(self.slot_kernel_map) > self.max_kernels):
+                        # compute slot to disable: the oldest is at index 0
+                        # find its slot index = (next_slot - active_slots) mod capacity
+                        oldest_slot = (self.next_slot - self.active_slots) % self.capacity
+                        # disable it
+                        self.force.setGlobalParameterDefaultValue(f"a_{oldest_slot}", 0.0)
+                        try:
+                            self.force.updateParametersInContext(simulation.context)
+                        except Exception:
+                            simulation.context.reinitialize(preserveState=True)
+                        # remove from bookkeeping
+                        if self.slot_kernel_map:
+                            self.slot_kernel_map.pop(0)
+
+                    # occasional compression of stored python-side kernels
+                    if (self.kernel_counter % 100) == 0:
+                        self._compressKernels()
+
+                else:
+                    # fallback to original behavior: append kernel and rebuild expression periodically
+                    if (self.max_kernels is not None) and (len(self.kernels) >= self.max_kernels):
+                        self.kernels.pop(0)
+                    self.kernels.append(kernel)
+                    self.kernel_counter += 1
+                    if (self.kernel_counter % self.rebuild_every) == 0:
+                        self._updateBiasExpression()
+                        try:
+                            self.force.updateParametersInContext(simulation.context)
+                        except Exception:
+                            simulation.context.reinitialize(preserveState=True)
 
                 # Save kernels periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
@@ -393,6 +490,9 @@ class OPES:
             f.write("height Z\n")
             for kernel in self.kernels:
                 f.write(" ".join(map(str, kernel)) + "\n")
+
+        # Note: CV history is written by the external reporter; we do not
+        # duplicate that here.
 
         # save a binary snapshot
         np.savez_compressed(npz_name, kernels=np.array(self.kernels))
