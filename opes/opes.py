@@ -76,7 +76,7 @@ class OPES:
         periodic=None,
         rebuild_every=10,
         max_kernels=None,
-        capacity=5000,
+        capacity=200,
     ):
         self.system = system
         self.variables = variables
@@ -179,19 +179,14 @@ class OPES:
 
     def _init_parameter_slots(self):
         """Pre-allocate global parameters for kernel slots and set a fixed
-        energy expression that sums over these slots. This avoids rebuilding
-        the expression when adding kernels; only global parameters change.
+        energy expression that sums over these slots.
         """
         N = self.capacity
-        # Build expression: sum over k terms of a_k * h_k * G_k * exp(beta*Z_k)
-        # where G_k is the multivariate Gaussian built from cv differences.
         kernel_terms = []
         for k in range(N):
             gaussian_terms = []
             for j in range(self.num_cvs):
-                # parameter names
                 c = f"c_{k}_{j}"
-                # periodic handling via cvj and center parameter
                 if self.periodic[j] is None:
                     diff = f"(cv{j}-{c})"
                 else:
@@ -200,10 +195,9 @@ class OPES:
                     diff = (
                         f"((cv{j}-{c})-{period}*floor(((cv{j}-{c})/{period})+0.5))"
                     )
-                gaussian_terms.append(f"(pow({diff},2)/{(self.sigma_vals[j] ** 2):.12g})")
+                gaussian_terms.append(f"(({diff})^2/{(self.sigma_vals[j] ** 2):.12g})")
 
             G = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
-            # parameters: active a_k, height h_k, Z_k
             a = f"a_{k}"
             h = f"h_{k}"
             Z = f"Z_{k}"
@@ -212,23 +206,31 @@ class OPES:
         sum_kernels = "+".join(kernel_terms) if kernel_terms else "0"
         bias_expr = f"-{float(self.kT):.12g}*log(1.0+({sum_kernels}))"
 
-        # set the energy function once
         self.force.setEnergyFunction(bias_expr)
 
-        # add global parameters with sensible defaults (disabled)
-        for k in range(N):
-            # centers for each CV
-            for j in range(self.num_cvs):
-                self.force.addGlobalParameter(f"c_{k}_{j}", 0.0)
-            # height, Z, active flag
-            self.force.addGlobalParameter(f"h_{k}", 0.0)
-            self.force.addGlobalParameter(f"Z_{k}", 0.0)
-            self.force.addGlobalParameter(f"a_{k}", 0.0)
+        # Add global parameters and store their indices
+        self.param_indices = {}  # Map from parameter name to index
 
-        # bookkeeping for slot management
-        self.next_slot = 0  # next slot to write into
+        for k in range(N):
+            for j in range(self.num_cvs):
+                name = f"c_{k}_{j}"
+                idx = self.force.addGlobalParameter(name, 0.0)
+                self.param_indices[name] = idx
+
+            name = f"h_{k}"
+            idx = self.force.addGlobalParameter(name, 0.0)
+            self.param_indices[name] = idx
+
+            name = f"Z_{k}"
+            idx = self.force.addGlobalParameter(name, 0.0)
+            self.param_indices[name] = idx
+
+            name = f"a_{k}"
+            idx = self.force.addGlobalParameter(name, 0.0)
+            self.param_indices[name] = idx
+
+        self.next_slot = 0
         self.active_slots = 0
-        # mapping from logical kernel index to slot assigned (for saving/dropping)
         self.slot_kernel_map = []
 
     def _updateBiasExpression(self):
@@ -269,8 +271,7 @@ class OPES:
                         f"((cv{j}-{center:.12g})-{period:.12g}*floor(((cv{j}-{center:.12g})/"
                         f"{period:.12g})+0.5))"
                     )
-                # pow instead of ^ and divide by sigma^2
-                gaussian_terms.append(f"(pow({diff_expr},2)/{(sigma_j ** 2):.12g})")
+                gaussian_terms.append(f"(({diff_expr})^2/{(sigma_j ** 2):.12g})")
 
             gaussian_expr = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
 
@@ -293,11 +294,17 @@ class OPES:
         Returns bias in kJ/mol (float).
         """
 
-        if len(self.kernels) == 0:
+        # Use slot_kernel_map in capacity mode, otherwise use kernels
+        if self.capacity and self.capacity > 0:
+            kernels_to_use = self.slot_kernel_map
+        else:
+            kernels_to_use = self.kernels
+
+        if len(kernels_to_use) == 0:
             return 0.0
 
         kernel_sum = 0.0
-        for kernel in self.kernels:
+        for kernel in kernels_to_use:
             gaussian = 1.0
             for j in range(self.num_cvs):
                 center = float(kernel[j])
@@ -323,21 +330,22 @@ class OPES:
         return float(Z)
 
     def _compressKernels(self):
-        """Compress kernels that are too close together.
+        """Compress kernels that are too close together."""
 
-        This function merges kernels whose distance in units of sigma is below the
-        compression_threshold.
-        """
+        # Use slot_kernel_map in capacity mode
+        if self.capacity and self.capacity > 0:
+            kernels_to_compress = self.slot_kernel_map
+        else:
+            kernels_to_compress = self.kernels
 
-        if len(self.kernels) < 2:
+        if len(kernels_to_compress) < 2:
             return
 
         compressed = []
 
-        for kernel in self.kernels:
+        for kernel in kernels_to_compress:
             placed = False
             for j, k2 in enumerate(compressed):
-                # compute normalized distance
                 dist2 = 0.0
                 for kk in range(self.num_cvs):
                     diff = self._periodic_difference(kernel[kk], k2[kk], kk)
@@ -345,127 +353,112 @@ class OPES:
                     dist2 += (diff / sigma_k) ** 2
                 dist = math.sqrt(dist2)
                 if dist < self.compression_threshold:
-                    # merge: weighted by heights
                     h_i = kernel[self.num_cvs]
                     h_j = k2[self.num_cvs]
                     total_h = h_i + h_j if (h_i + h_j) != 0 else 1.0
                     for kk in range(self.num_cvs):
                         k2[kk] = (h_i * kernel[kk] + h_j * k2[kk]) / total_h
-                    # heights add
                     k2[self.num_cvs] += kernel[self.num_cvs]
-                    # average Z weighted by heights
                     k2[self.num_cvs + 1] = (
-                        h_i * kernel[self.num_cvs + 1] + h_j * k2[self.num_cvs + 1]
-                    ) / total_h
+                                                   h_i * kernel[self.num_cvs + 1] + h_j * k2[self.num_cvs + 1]
+                                           ) / total_h
                     placed = True
                     break
             if not placed:
                 compressed.append(list(kernel))
 
-        old_count = len(self.kernels)
-        self.kernels = compressed
-        new_count = len(self.kernels)
+        old_count = len(kernels_to_compress)
+
+        # Update the appropriate list
+        if self.capacity and self.capacity > 0:
+            self.slot_kernel_map = compressed
+        else:
+            self.kernels = compressed
+
+        new_count = len(compressed)
         if new_count < old_count:
             print(f"OPES: Compressed {old_count} kernels to {new_count}")
 
     def step(self, simulation, steps):
         """
         Advance the simulation while depositing OPES kernels.
-
-        Parameters
-        ----------
-        simulation : openmm.app.Simulation
-            The simulation to advance
-        steps : int
-            Number of steps to run
         """
 
-        for _ in range(int(steps)):
-            simulation.step(1)
-            self.step_count += 1
+        steps_remaining = int(steps)
 
-            # Deposit kernel at stride
+        while steps_remaining > 0:
+            # Calculate steps until next kernel deposition
+            steps_until_next = self.stride - (self.step_count % self.stride)
+            steps_to_run = min(steps_until_next, steps_remaining)
+
+            # Run multiple steps at once (much faster!)
+            simulation.step(steps_to_run)
+            self.step_count += steps_to_run
+            steps_remaining -= steps_to_run
+
+            # Deposit kernel if we hit the stride
             if (self.step_count % self.stride) == 0:
-                # Get current CV values via the CustomCVForce API
+                # Get current CV values
                 cv_values = self.force.getCollectiveVariableValues(simulation.context)
-                # make sure we have numeric floats
                 cv_values = [float(x) for x in cv_values]
 
-                # Compute Z value
+                # Compute Z and height
                 Z = self._computeZ(cv_values)
-
-                # Compute kernel height using the canonical OPES rule (Invernizzi & Parrinello):
-                #   h = kT * ln(1 + epsilon / p_est(s))
-                # where p_est(s) is the current estimated probability (unnormalized) at the CV point.
-                # We have Z = -bias/kT, so p_est_unnorm = exp(Z). Epsilon is exp(-barrier/kT).
-                # Add a tiny floor to p_est to avoid division by zero.
                 tiny = 1e-300
-                p_est = math.exp(Z)
+                p_est = math.exp(-Z)
                 if not np.isfinite(p_est) or p_est <= 0.0:
                     p_est = tiny
                 height = float(self.kT * math.log(1.0 + (self.epsilon / p_est)))
 
-                # Store kernel as numeric list
                 kernel = [float(x) for x in cv_values] + [height, float(Z)]
 
-                # If capacity mode is active, write into the next global-parameter slot
+                # Capacity mode
+                # In the capacity mode section of step():
                 if self.capacity and self.capacity > 0:
                     slot = self.next_slot
-                    # set center parameters
+                    # Set center parameters using indices
                     for j in range(self.num_cvs):
                         pname = f"c_{slot}_{j}"
-                        self.force.setGlobalParameterDefaultValue(pname, float(cv_values[j]))
-                    # set height and Z, enable slot
-                    self.force.setGlobalParameterDefaultValue(f"h_{slot}", float(height))
-                    self.force.setGlobalParameterDefaultValue(f"Z_{slot}", float(Z))
-                    self.force.setGlobalParameterDefaultValue(f"a_{slot}", 1.0)
+                        idx = self.param_indices[pname]
+                        self.force.setGlobalParameterDefaultValue(idx, float(cv_values[j]))
 
-                    # update the context with new parameter defaults (fast)
-                    try:
-                        self.force.updateParametersInContext(simulation.context)
-                    except Exception:
-                        # if update fails, fallback to reinitialization
-                        simulation.context.reinitialize(preserveState=True)
+                    # Set height, Z, and active flag using indices
+                    idx_h = self.param_indices[f"h_{slot}"]
+                    idx_Z = self.param_indices[f"Z_{slot}"]
+                    idx_a = self.param_indices[f"a_{slot}"]
 
-                    # bookkeeping
+                    self.force.setGlobalParameterDefaultValue(idx_h, float(height))
+                    self.force.setGlobalParameterDefaultValue(idx_Z, float(Z))
+                    self.force.setGlobalParameterDefaultValue(idx_a, 1.0)
+
+                    self.force.updateParametersInContext(simulation.context)
+
                     self.slot_kernel_map.append(kernel)
                     self.next_slot = (self.next_slot + 1) % self.capacity
                     self.active_slots = min(self.capacity, self.active_slots + 1)
                     self.kernel_counter += 1
 
-                    # Enforce max_kernels by disabling oldest slot if needed
                     if (self.max_kernels is not None) and (len(self.slot_kernel_map) > self.max_kernels):
-                        # compute slot to disable: the oldest is at index 0
-                        # find its slot index = (next_slot - active_slots) mod capacity
                         oldest_slot = (self.next_slot - self.active_slots) % self.capacity
-                        # disable it
-                        self.force.setGlobalParameterDefaultValue(f"a_{oldest_slot}", 0.0)
-                        try:
-                            self.force.updateParametersInContext(simulation.context)
-                        except Exception:
-                            simulation.context.reinitialize(preserveState=True)
-                        # remove from bookkeeping
+                        idx_a_old = self.param_indices[f"a_{oldest_slot}"]
+                        self.force.setGlobalParameterDefaultValue(idx_a_old, 0.0)
+                        self.force.updateParametersInContext(simulation.context)
                         if self.slot_kernel_map:
                             self.slot_kernel_map.pop(0)
 
-                    # occasional compression of stored python-side kernels
                     if (self.kernel_counter % 100) == 0:
                         self._compressKernels()
-
                 else:
-                    # fallback to original behavior: append kernel and rebuild expression periodically
+                    # Dynamic mode
                     if (self.max_kernels is not None) and (len(self.kernels) >= self.max_kernels):
                         self.kernels.pop(0)
                     self.kernels.append(kernel)
                     self.kernel_counter += 1
                     if (self.kernel_counter % self.rebuild_every) == 0:
                         self._updateBiasExpression()
-                        try:
-                            self.force.updateParametersInContext(simulation.context)
-                        except Exception:
-                            simulation.context.reinitialize(preserveState=True)
+                        simulation.context.reinitialize(preserveState=True)
 
-                # Save kernels periodically
+                # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
                     self.saveKernels()
 
@@ -480,6 +473,12 @@ class OPES:
         txt_name = os.path.join(self.biasDir, f"kernels_{self.step_count}.txt")
         npz_name = os.path.join(self.biasDir, f"kernels_{self.step_count}.npz")
 
+        # Use slot_kernel_map in capacity mode, otherwise use kernels
+        if self.capacity and self.capacity > 0:
+            kernels_to_save = self.slot_kernel_map
+        else:
+            kernels_to_save = self.kernels
+
         with open(txt_name, 'w') as f:
             f.write(f"# OPES Kernels at step {self.step_count}\n")
             f.write(f"# Temperature: {self.kT} kJ/mol\n")
@@ -488,14 +487,11 @@ class OPES:
             for i in range(self.num_cvs):
                 f.write(f"cv{i} ")
             f.write("height Z\n")
-            for kernel in self.kernels:
+            for kernel in kernels_to_save:
                 f.write(" ".join(map(str, kernel)) + "\n")
 
-        # Note: CV history is written by the external reporter; we do not
-        # duplicate that here.
-
         # save a binary snapshot
-        np.savez_compressed(npz_name, kernels=np.array(self.kernels))
+        np.savez_compressed(npz_name, kernels=np.array(kernels_to_save))
 
     def loadKernels(self, filename):
         """Load kernels from a plain text or numpy npz file."""

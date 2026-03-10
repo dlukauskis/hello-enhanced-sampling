@@ -6,11 +6,12 @@ from openmm.unit import kelvin, kilojoules_per_mole, picosecond, radian
 import opes
 import numpy as np
 import os
-from opes.opes_reporter import OPEsCVReporter
+from opes_reporter import OPESCVReporter
 
-# total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings
-total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings
-kernel_pace = 500
+# total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings with wt-metad
+total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings with wt-metad
+# total_steps = 5000  # 0.01 ns with 2 fs timestep, just a smoke test
+kernel_pace = 100
 stride = 500
 
 
@@ -35,7 +36,7 @@ opes_bias = opes.OPES(
     system=system,
     variables=[cv1, cv2],
     temperature=300 * kelvin,
-    barrier=10 * kilojoules_per_mole,
+    barrier=40 * kilojoules_per_mole,
     sigma=[0.35 * radian, 0.35 * radian],
     stride=kernel_pace,
     saveFrequency=stride,
@@ -53,7 +54,7 @@ simulation.context.setPositions(pdb_file.positions)
 # add CV reporter
 os.makedirs(opes_bias.biasDir, exist_ok=True)
 cv_report_file = os.path.join(opes_bias.biasDir, 'cv_history.txt')
-cv_reporter = OPEsCVReporter(cv_report_file, kernel_pace, opes_bias)
+cv_reporter = OPESCVReporter(cv_report_file, kernel_pace, opes_bias)
 simulation.reporters.append(cv_reporter)
 
 simulation.reporters.append(StateDataReporter(
@@ -71,7 +72,7 @@ cv_grid = [np.linspace(-3.14, 3.14, 200), np.linspace(-3.14, 3.14, 200)]
 fes = opes_bias.getFreeEnergy(cv_grid)
 
 # save fes for later analysis
-fes_out_fpath = os.path.join('results', 'opes_output_fes.npz')
+fes_out_fpath = os.path.join('output', 'opes_output_fes.npz')
 np.savez_compressed(fes_out_fpath, fes=fes, grid0=cv_grid[0], grid1=cv_grid[1])
 
 # save kernels and cv history

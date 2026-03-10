@@ -15,7 +15,7 @@ import numpy as np
 import openmm.unit as unit
 
 
-class OPEsCVReporter:
+class OPESCVReporter:
     def __init__(self, file, reportInterval, opes_instance, append=False):
         self._reportInterval = int(reportInterval)
         self._openedFile = isinstance(file, str)
