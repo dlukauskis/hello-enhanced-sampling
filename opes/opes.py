@@ -1,20 +1,7 @@
 """
 OPES (On-the-fly Probability Enhanced Sampling) for OpenMM
-Based on: Invernizzi & Parrinello, J. Phys. Chem. Lett. 2020, 11, 2731-2736
-
-This file contains a corrected and more robust implementation of OPES for
-small-molecule tests (e.g. alanine dipeptide). The key fixes are:
- - correct initialization order (num_cvs before using it)
- - consistent unit handling: numeric kT in kJ/mol, numeric sigmas in the CV units
- - valid OpenMM expression syntax using pow(x,2)
- - avoid extremely frequent Context.reinitialize() by rebuilding bias only
-   every `rebuild_every` kernels (default 10)
- - store kernel centers/heights/Z as plain Python floats
- - fix step counting and CV collection
-
-This is intended as a compact, pragmatic implementation for validation and
-small-scale testing. A production-grade implementation would expose more
-options and optimize kernel storage/merging further.
+Based on PLUMED implementation: https://github.com/plumed/plumed2/blob/master/src/opes/OPESmetad.cpp
+Reference: Invernizzi & Parrinello, J. Phys. Chem. Lett. 2020, 11, 2731-2736
 """
 
 import math
@@ -22,44 +9,41 @@ import numpy as np
 import os
 from openmm import CustomCVForce
 from openmm import unit
-# use unit.kilojoules_per_mole, unit.nanometer, unit.radian explicitly to avoid
-# static-analysis name resolution issues
 
 
 class OPES:
     """
     On-the-fly Probability Enhanced Sampling (OPES) method.
 
+    The bias is: V(s) = (1-1/γ) * kT * log(P(s)/Z + ε)
+    where P(s) is estimated via weighted kernel density estimation.
+
     Parameters
     ----------
     system : openmm.System
         The system to which the bias will be applied
-    variables : list of openmm.Force or callable
-        The collective variables to bias (e.g. CustomTorsionForce objects)
+    variables : list of openmm.Force
+        The collective variables to bias
     temperature : openmm.unit.Quantity
         The temperature at which the simulation is run
     barrier : openmm.unit.Quantity
-        The energy barrier estimate (default: 10 kJ/mol)
-    sigma : list of openmm.unit.Quantity or single Quantity
-        Width of kernels for each CV (must be provided in the appropriate unit,
-        e.g. `0.35 * radian` for torsions). If a single Quantity is given,
-        it is broadcast for all CVs.
+        The free energy barrier to overcome (typically 30-50 kJ/mol)
+    sigma : list of openmm.unit.Quantity or None
+        Initial bandwidth for each CV (if None, uses adaptive)
     stride : int
         Deposition frequency in time steps (default: 500)
     compression_threshold : float
-        Threshold for kernel compression in units of sigma (default: 1.0)
+        Merge kernels closer than this threshold (default: 1.0)
     saveFrequency : int
-        Frequency to save kernels and bias (default: 10000 steps)
+        Frequency to save kernels (default: 10000 steps)
     biasDir : str
-        Directory to save bias information (default: None)
+        Directory to save bias information
     periodic : list of (min,max) tuples or None
-        Periodic ranges for each CV (e.g. [(-pi,pi),(-pi,pi)] for torsions)
-    rebuild_every : int
-        Rebuild the CustomCVForce energy expression and reinitialize the
-        context only every `rebuild_every` kernels to avoid excessive overhead.
-    max_kernels : int or None
-        Optional cap on number of kernels (old kernels will be dropped when
-        exceeded).
+        Periodic ranges for each CV
+    bias_factor : float or None
+        Well-tempered bias factor γ. If None, derived from BARRIER
+    adaptive_sigma : bool
+        Whether to adapt sigma during simulation (default: True)
     """
 
     def __init__(
@@ -67,24 +51,21 @@ class OPES:
         system,
         variables,
         temperature,
-        barrier=10 * unit.kilojoules_per_mole,
+        barrier,
         sigma=None,
         stride=500,
         compression_threshold=1.0,
         saveFrequency=10000,
         biasDir=None,
         periodic=None,
-        rebuild_every=10,
-        max_kernels=None,
-        capacity=200,
+        bias_factor=None,
+        adaptive_sigma=True,
     ):
         self.system = system
         self.variables = variables
-
-        # Number of CVs (must be known early)
         self.num_cvs = len(variables)
 
-        # Periodic boundaries for each CV
+        # Periodic boundaries
         if periodic is None:
             self.periodic = [None] * self.num_cvs
         else:
@@ -92,297 +73,287 @@ class OPES:
                 raise ValueError("`periodic` must have the same length as `variables`")
             self.periodic = periodic
 
-        # Thermodynamic beta (unitless) and kT numeric in kJ/mol
+        # Temperature
         kB = unit.BOLTZMANN_CONSTANT_kB * unit.AVOGADRO_CONSTANT_NA
         kT_quantity = kB * temperature
-        # numeric kT in kJ/mol (float)
         self.kT = kT_quantity.value_in_unit(unit.kilojoules_per_mole)
         self.beta = 1.0 / self.kT
 
-        self.barrier = barrier
+        # BARRIER and derived parameters
+        self.barrier = barrier.value_in_unit(unit.kilojoules_per_mole)
+
+        # Derive bias_factor from BARRIER if not provided
+        # PLUMED uses: biasfactor = 1 + barrier/(kT)
+        if bias_factor is None:
+            self.bias_factor = 1.0 + self.barrier / self.kT
+        else:
+            self.bias_factor = float(bias_factor)
+
+        # Epsilon: regularization constant
+        # PLUMED: epsilon = exp(-barrier/kT) / (avgN + exp(-barrier/kT))
+        # Simplified: epsilon ≈ exp(-barrier/kT)
+        self.epsilon = math.exp(-self.barrier / self.kT)
+
+        print(f"OPES parameters:")
+        print(f"  BARRIER = {self.barrier:.2f} kJ/mol")
+        print(f"  kT = {self.kT:.2f} kJ/mol")
+        print(f"  bias_factor (γ) = {self.bias_factor:.2f}")
+        print(f"  epsilon = {self.epsilon:.6f}")
+
         self.stride = int(stride)
         self.compression_threshold = compression_threshold
         self.saveFrequency = int(saveFrequency)
         self.biasDir = biasDir
-        self.rebuild_every = max(1, int(rebuild_every))
-        self.max_kernels = None if max_kernels is None else int(max_kernels)
-        # When capacity is provided, pre-allocate parameterized kernel slots
-        # and never rebuild the force expression; this allows fast updates via
-        # CustomCVForce global parameters and updateParametersInContext(). If
-        # capacity is None or 0, fall back to the previous dynamic-expression
-        # behavior.
-        self.capacity = None if capacity is None else int(capacity)
+        self.adaptive_sigma = adaptive_sigma
 
-        # CV tracking is delegated to an external reporter (OPEsCVReporter).
-        # Previously we stored CVs in-memory; that has been removed to mirror
-        # the wt-metadetics approach (separate reporter class).
-
-        # Kernel widths: accept single sigma or list
+        # Initial bandwidth (sigma)
         if sigma is None:
-            # Default sigma: assume angular CVs (radian) for safety
             sigma = [0.1 * unit.radian] * self.num_cvs
         if not hasattr(sigma, '__iter__') or isinstance(sigma, unit.Quantity):
             sigma = [sigma] * self.num_cvs
         if len(sigma) != self.num_cvs:
             raise ValueError("`sigma` must have the same length as `variables`")
 
-        # Convert sigma to numeric values in appropriate units: if CV is periodic
-        # (angles) prefer radian, otherwise use nanometer. We trust the user to
-        # provide reasonable sigma units; fallback choices kept pragmatic.
         self.sigma = list(sigma)
-        self.sigma_vals = []
+        self.sigma0_vals = []  # Initial sigma values
+        self.sigma_vals = []    # Current sigma values
+
         for i, s in enumerate(self.sigma):
             if hasattr(s, 'unit'):
-                # choose radian when periodic range is given (angles)
                 if self.periodic[i] is not None:
                     val = s.value_in_unit(unit.radian)
                 else:
-                    # assume distance-like CV
                     val = s.value_in_unit(unit.nanometer)
             else:
-                # bare float: assume already in correct units
                 val = float(s)
-            # store numeric positive sigma
+            self.sigma0_vals.append(float(np.abs(val)))
             self.sigma_vals.append(float(np.abs(val)))
 
-        # Storage for kernels: each kernel is [cv0,..., cvN-1, height, Z]
+        # Storage for kernels: [cv0, cv1, ..., weight, height]
+        # height is for Gaussian normalization: h = 1/[(2π)^(d/2) * Π σ_i]
         self.kernels = []
         self.kernel_counter = 0
 
-        # OPES-specific epsilon (numeric)
-        self.epsilon = math.exp(-self.barrier.value_in_unit(unit.kilojoules_per_mole) / self.kT)
+        # Z_n: normalization over explored CV space
+        self.Zn = 1.0
 
-        # Create the bias force and add to the system
+        # Create the bias force
         self._createBiasForce()
-        # If capacity mode is enabled, initialize parameter slots in the force
-        if self.capacity and self.capacity > 0:
-            self._init_parameter_slots()
 
         # Statistics
         self.step_count = 0
+        self.sum_weights = 0.0
+        self.sum_weights_sq = 0.0
 
     def _createBiasForce(self):
-        """Create the CustomCVForce for OPES bias and register CVs."""
+        """Create the CustomCVForce for OPES bias."""
 
-        # initial zero energy expression
-        # We'll set an expression later depending on whether capacity mode is used
         self.force = CustomCVForce("0")
 
-        # Add collective variables (each variable object is passed directly)
         for i, var in enumerate(self.variables):
-            # name "cv{i}" will be used in the expression
             self.force.addCollectiveVariable(f"cv{i}", var)
 
-        # put bias into a separate force group
         self.force.setForceGroup(15)
         self.system.addForce(self.force)
 
-    def _init_parameter_slots(self):
-        """Pre-allocate global parameters for kernel slots and set a fixed
-        energy expression that sums over these slots.
+    def _periodic_difference(self, value, center, cv_index):
+        """Calculate periodic difference for a CV."""
+
+        if self.periodic[cv_index] is None:
+            return float(value - center)
+
+        period_min, period_max = self.periodic[cv_index]
+        period = period_max - period_min
+
+        diff = float(value - center)
+        diff = diff - period * round(diff / period)
+        return float(diff)
+
+    def _gaussian_height(self):
+        """Calculate Gaussian normalization height: h = 1/[(2π)^(d/2) * Π σ_i]"""
+        h = 1.0
+        for i in range(self.num_cvs):
+            h /= (self.sigma_vals[i] * math.sqrt(2.0 * math.pi))
+        return h
+
+    def _evaluateProbability(self, cv_values):
         """
-        N = self.capacity
-        kernel_terms = []
-        for k in range(N):
-            gaussian_terms = []
-            for j in range(self.num_cvs):
-                c = f"c_{k}_{j}"
-                if self.periodic[j] is None:
-                    diff = f"(cv{j}-{c})"
-                else:
-                    pmin, pmax = self.periodic[j]
-                    period = pmax - pmin
-                    diff = (
-                        f"((cv{j}-{c})-{period}*floor(((cv{j}-{c})/{period})+0.5))"
-                    )
-                gaussian_terms.append(f"(({diff})^2/{(self.sigma_vals[j] ** 2):.12g})")
+        Evaluate probability estimate at given CV values.
 
-            G = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
-            a = f"a_{k}"
-            h = f"h_{k}"
-            Z = f"Z_{k}"
-            kernel_terms.append(f"({a}*{h}*{G}*exp({self.beta:.12g}*{Z}))")
-
-        sum_kernels = "+".join(kernel_terms) if kernel_terms else "0"
-        bias_expr = f"-{float(self.kT):.12g}*log(1.0+({sum_kernels}))"
-
-        self.force.setEnergyFunction(bias_expr)
-
-        # Add global parameters and store their indices
-        self.param_indices = {}  # Map from parameter name to index
-
-        for k in range(N):
-            for j in range(self.num_cvs):
-                name = f"c_{k}_{j}"
-                idx = self.force.addGlobalParameter(name, 0.0)
-                self.param_indices[name] = idx
-
-            name = f"h_{k}"
-            idx = self.force.addGlobalParameter(name, 0.0)
-            self.param_indices[name] = idx
-
-            name = f"Z_{k}"
-            idx = self.force.addGlobalParameter(name, 0.0)
-            self.param_indices[name] = idx
-
-            name = f"a_{k}"
-            idx = self.force.addGlobalParameter(name, 0.0)
-            self.param_indices[name] = idx
-
-        self.next_slot = 0
-        self.active_slots = 0
-        self.slot_kernel_map = []
-
-    def _updateBiasExpression(self):
-        """Update the bias energy expression based on current kernels.
-
-        Note: this reconstructs a CustomCVForce energy function string. For
-        efficiency we recommend calling this only every `rebuild_every` kernel
-        additions.
+        P(s) = Σ w_k * h_k * G(s, s_k) / Σ w_k
         """
 
-        if self.capacity and self.capacity > 0:
-            # In capacity mode the expression is fixed by `_init_parameter_slots`.
-            return
         if len(self.kernels) == 0:
-            self.force.setEnergyFunction("0")
-            return
+            return 0.0  # Will be regularized by epsilon
 
-        kernel_terms = []
-        # Precompute numeric constants
-        kT_num = float(self.kT)
+        weighted_sum = 0.0
 
-        for ik, kernel in enumerate(self.kernels):
-            # kernel: [cv0,...,cvN-1, height, Z]
-            gaussian_terms = []
-            for j in range(self.num_cvs):
-                center = float(kernel[j])
-                sigma_j = float(self.sigma_vals[j])
-
-                if self.periodic[j] is None:
-                    # non-periodic difference
-                    diff_expr = f"(cv{j}-{center:.12g})"
-                else:
-                    # periodic wrapping to [-period/2,period/2]
-                    pmin, pmax = self.periodic[j]
-                    period = pmax - pmin
-                    # OpenMM expression to wrap difference
-                    diff_expr = (
-                        f"((cv{j}-{center:.12g})-{period:.12g}*floor(((cv{j}-{center:.12g})/"
-                        f"{period:.12g})+0.5))"
-                    )
-                gaussian_terms.append(f"(({diff_expr})^2/{(sigma_j ** 2):.12g})")
-
-            gaussian_expr = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
-
-            height = float(kernel[self.num_cvs])
-            Z = float(kernel[self.num_cvs + 1])
-
-            # Each kernel term: height * exp(-0.5*...) * exp(beta*Z)
-            # beta*Z is dimensionless here because Z will be provided as numeric -Z/kT
-            kernel_terms.append(f"({height:.12g}*{gaussian_expr}*exp({self.beta:.12g}*{Z:.12g}))")
-
-        sum_kernels = "+".join(kernel_terms)
-        bias_expr = f"-{kT_num:.12g}*log(1.0+({sum_kernels}))"
-
-        # Set the energy function
-        self.force.setEnergyFunction(bias_expr)
-
-    def _evaluateBias(self, cv_values):
-        """Evaluate current bias at given CV values (cv_values: iterable of floats).
-
-        Returns bias in kJ/mol (float).
-        """
-
-        # Use slot_kernel_map in capacity mode, otherwise use kernels
-        if self.capacity and self.capacity > 0:
-            kernels_to_use = self.slot_kernel_map
-        else:
-            kernels_to_use = self.kernels
-
-        if len(kernels_to_use) == 0:
-            return 0.0
-
-        kernel_sum = 0.0
-        for kernel in kernels_to_use:
+        for kernel in self.kernels:
+            # Gaussian kernel (already normalized by height)
             gaussian = 1.0
             for j in range(self.num_cvs):
-                center = float(kernel[j])
-                sigma_j = float(self.sigma_vals[j])
-                diff = self._periodic_difference(float(cv_values[j]), center, j)
-                gaussian *= math.exp(-0.5 * (diff / sigma_j) ** 2)
+                center = kernel[j]
+                sigma_j = self.sigma_vals[j]
+                diff = self._periodic_difference(cv_values[j], center, j)
+                gaussian *= math.exp(-0.5 * (diff / sigma_j)**2)
 
-            height = float(kernel[self.num_cvs])
-            Z = float(kernel[self.num_cvs + 1])
+            weight = kernel[self.num_cvs]      # w_k
+            height = kernel[self.num_cvs + 1]  # h_k (normalization)
 
-            kernel_sum += height * gaussian * math.exp(self.beta * Z)
+            weighted_sum += weight * height * gaussian
 
-        bias = -self.kT * math.log(1.0 + kernel_sum)
+        # Normalize by sum of weights
+        prob_estimate = weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
+        return prob_estimate
+
+    def _evaluateBias(self, cv_values):
+        """
+        Evaluate bias at given CV values.
+
+        V(s) = (1 - 1/γ) * kT * log(P(s)/Z_n + ε)
+        """
+
+        prob = self._evaluateProbability(cv_values)
+
+        # Regularized probability: P/Z + ε
+        regularized_prob = prob / self.Zn + self.epsilon
+
+        # Avoid log of non-positive values
+        if regularized_prob <= 0 or not np.isfinite(regularized_prob):
+            regularized_prob = self.epsilon
+
+        # Well-tempered bias
+        bias = (1.0 - 1.0/self.bias_factor) * self.kT * math.log(regularized_prob)
+
         return float(bias)
 
-    def _computeZ(self, cv_values):
-        """Compute the Z value (related to the negative log probability).
-
-        Here we use the current bias estimate: Z = -bias / kT
+    def _updateZn(self):
         """
-        bias = self._evaluateBias(cv_values)
-        Z = -bias / self.kT
-        return float(Z)
+        Update Z_n: normalization over explored CV space.
+
+        Z_n estimates the volume of CV space that has been explored.
+        Simple estimate: Z_n = effective_sample_size
+        """
+
+        # Effective sample size: N_eff = (Σ w_k)^2 / Σ w_k^2
+        if self.sum_weights_sq > 0:
+            N_eff = self.sum_weights**2 / self.sum_weights_sq
+            self.Zn = max(1.0, N_eff)
+        else:
+            self.Zn = 1.0
+
+    def _updateBiasExpression(self):
+        """
+        Update the bias energy expression.
+
+        V(s) = (1-1/γ) * kT * log(P(s)/Z_n + ε)
+        """
+
+        if len(self.kernels) == 0:
+            # No kernels yet: V = (1-1/γ) * kT * log(ε)
+            coeff = (1.0 - 1.0/self.bias_factor) * self.kT
+            bias_expr = f"{coeff:.12g}*{math.log(self.epsilon):.12g}"
+            self.force.setEnergyFunction(bias_expr)
+            return
+
+        # Build kernel sum expression: Σ w_k * h_k * G(s,s_k)
+        kernel_terms = []
+
+        for kernel in self.kernels:
+            # Gaussian terms for each CV
+            gaussian_terms = []
+            for j in range(self.num_cvs):
+                center = float(kernel[j])
+                sigma_j = float(self.sigma_vals[j])
+
+                if self.periodic[j] is None:
+                    diff = f"(cv{j}-{center:.12g})"
+                else:
+                    pmin, pmax = self.periodic[j]
+                    period = pmax - pmin
+                    diff = f"((cv{j}-{center:.12g})-{period:.12g}*floor(((cv{j}-{center:.12g})/{period:.12g})+0.5))"
+
+                gaussian_terms.append(f"(({diff})^2/{(sigma_j**2):.12g})")
+
+            gaussian_expr = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
+            weight = float(kernel[self.num_cvs])
+            height = float(kernel[self.num_cvs + 1])
+
+            kernel_terms.append(f"({weight:.12g}*{height:.12g}*{gaussian_expr})")
+
+        # P(s) = Σ w_k * h_k * G(s,s_k) / Σ w_k
+        prob_expr = f"({'+'.join(kernel_terms)})/{self.sum_weights:.12g}"
+
+        # P(s)/Z_n + ε
+        regularized_expr = f"({prob_expr})/{self.Zn:.12g}+{self.epsilon:.12g}"
+
+        # V(s) = (1-1/γ) * kT * log(P(s)/Z_n + ε)
+        coeff = (1.0 - 1.0/self.bias_factor) * self.kT
+        bias_expr = f"{coeff:.12g}*log({regularized_expr})"
+
+        self.force.setEnergyFunction(bias_expr)
+
+    def _adaptBandwidth(self):
+        """
+        Adapt bandwidth using Silverman's rule.
+
+        σ_i^(n) = σ_i^(0) * [N_eff * (d+2)/4]^(-1/(d+4))
+        """
+
+        if not self.adaptive_sigma or len(self.kernels) < 2:
+            return
+
+        # Effective sample size
+        N_eff = self.sum_weights**2 / self.sum_weights_sq if self.sum_weights_sq > 0 else 1.0
+
+        # Silverman's rule
+        d = self.num_cvs
+        factor = (N_eff * (d + 2) / 4.0) ** (-1.0 / (d + 4))
+
+        for i in range(self.num_cvs):
+            self.sigma_vals[i] = self.sigma0_vals[i] * factor
 
     def _compressKernels(self):
         """Compress kernels that are too close together."""
 
-        # Use slot_kernel_map in capacity mode
-        if self.capacity and self.capacity > 0:
-            kernels_to_compress = self.slot_kernel_map
-        else:
-            kernels_to_compress = self.kernels
-
-        if len(kernels_to_compress) < 2:
+        if len(self.kernels) < 2:
             return
 
         compressed = []
 
-        for kernel in kernels_to_compress:
+        for kernel in self.kernels:
             placed = False
-            for j, k2 in enumerate(compressed):
+            for comp_kernel in compressed:
+                # Calculate normalized distance
                 dist2 = 0.0
-                for kk in range(self.num_cvs):
-                    diff = self._periodic_difference(kernel[kk], k2[kk], kk)
-                    sigma_k = self.sigma_vals[kk]
-                    dist2 += (diff / sigma_k) ** 2
+                for j in range(self.num_cvs):
+                    diff = self._periodic_difference(kernel[j], comp_kernel[j], j)
+                    sigma_j = self.sigma_vals[j]
+                    dist2 += (diff / sigma_j)**2
                 dist = math.sqrt(dist2)
+
                 if dist < self.compression_threshold:
-                    h_i = kernel[self.num_cvs]
-                    h_j = k2[self.num_cvs]
-                    total_h = h_i + h_j if (h_i + h_j) != 0 else 1.0
-                    for kk in range(self.num_cvs):
-                        k2[kk] = (h_i * kernel[kk] + h_j * k2[kk]) / total_h
-                    k2[self.num_cvs] += kernel[self.num_cvs]
-                    k2[self.num_cvs + 1] = (
-                                                   h_i * kernel[self.num_cvs + 1] + h_j * k2[self.num_cvs + 1]
-                                           ) / total_h
+                    # Merge: add weights (heights are the same since sigma is global)
+                    comp_kernel[self.num_cvs] += kernel[self.num_cvs]
                     placed = True
                     break
+
             if not placed:
                 compressed.append(list(kernel))
 
-        old_count = len(kernels_to_compress)
+        old_count = len(self.kernels)
+        self.kernels = compressed
+        new_count = len(self.kernels)
 
-        # Update the appropriate list
-        if self.capacity and self.capacity > 0:
-            self.slot_kernel_map = compressed
-        else:
-            self.kernels = compressed
+        # Recalculate sum_weights after compression
+        self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
+        self.sum_weights_sq = sum(k[self.num_cvs]**2 for k in self.kernels)
 
-        new_count = len(compressed)
         if new_count < old_count:
             print(f"OPES: Compressed {old_count} kernels to {new_count}")
 
     def step(self, simulation, steps):
-        """
-        Advance the simulation while depositing OPES kernels.
-        """
+        """Advance the simulation while depositing OPES kernels."""
 
         steps_remaining = int(steps)
 
@@ -391,79 +362,55 @@ class OPES:
             steps_until_next = self.stride - (self.step_count % self.stride)
             steps_to_run = min(steps_until_next, steps_remaining)
 
-            # Run multiple steps at once (much faster!)
+            # Run simulation
             simulation.step(steps_to_run)
             self.step_count += steps_to_run
             steps_remaining -= steps_to_run
 
-            # Deposit kernel if we hit the stride
+            # Deposit kernel at stride
             if (self.step_count % self.stride) == 0:
                 # Get current CV values
                 cv_values = self.force.getCollectiveVariableValues(simulation.context)
                 cv_values = [float(x) for x in cv_values]
 
-                # Compute Z and height
-                Z = self._computeZ(cv_values)
-                tiny = 1e-300
-                p_est = math.exp(-Z)
-                if not np.isfinite(p_est) or p_est <= 0.0:
-                    p_est = tiny
-                height = float(self.kT * math.log(1.0 + (self.epsilon / p_est)))
+                # Calculate weight: w_k = exp(β * V_{k-1}(s_k))
+                current_bias = self._evaluateBias(cv_values)
+                weight = math.exp(self.beta * current_bias)
 
-                kernel = [float(x) for x in cv_values] + [height, float(Z)]
+                # Gaussian height (normalization factor)
+                height = self._gaussian_height()
 
-                # Capacity mode
-                # In the capacity mode section of step():
-                if self.capacity and self.capacity > 0:
-                    slot = self.next_slot
-                    # Set center parameters using indices
-                    for j in range(self.num_cvs):
-                        pname = f"c_{slot}_{j}"
-                        idx = self.param_indices[pname]
-                        self.force.setGlobalParameterDefaultValue(idx, float(cv_values[j]))
+                # Deposit kernel: [cv0, cv1, ..., weight, height]
+                kernel = cv_values + [weight, height]
+                self.kernels.append(kernel)
+                self.kernel_counter += 1
 
-                    # Set height, Z, and active flag using indices
-                    idx_h = self.param_indices[f"h_{slot}"]
-                    idx_Z = self.param_indices[f"Z_{slot}"]
-                    idx_a = self.param_indices[f"a_{slot}"]
+                # Update statistics
+                self.sum_weights += weight
+                self.sum_weights_sq += weight**2
 
-                    self.force.setGlobalParameterDefaultValue(idx_h, float(height))
-                    self.force.setGlobalParameterDefaultValue(idx_Z, float(Z))
-                    self.force.setGlobalParameterDefaultValue(idx_a, 1.0)
+                # Update Z_n
+                self._updateZn()
 
-                    self.force.updateParametersInContext(simulation.context)
+                # Adapt bandwidth periodically
+                if self.kernel_counter % 100 == 0:
+                    self._adaptBandwidth()
 
-                    self.slot_kernel_map.append(kernel)
-                    self.next_slot = (self.next_slot + 1) % self.capacity
-                    self.active_slots = min(self.capacity, self.active_slots + 1)
-                    self.kernel_counter += 1
+                # Compress kernels periodically
+                if self.kernel_counter % 100 == 0:
+                    self._compressKernels()
 
-                    if (self.max_kernels is not None) and (len(self.slot_kernel_map) > self.max_kernels):
-                        oldest_slot = (self.next_slot - self.active_slots) % self.capacity
-                        idx_a_old = self.param_indices[f"a_{oldest_slot}"]
-                        self.force.setGlobalParameterDefaultValue(idx_a_old, 0.0)
-                        self.force.updateParametersInContext(simulation.context)
-                        if self.slot_kernel_map:
-                            self.slot_kernel_map.pop(0)
-
-                    if (self.kernel_counter % 100) == 0:
-                        self._compressKernels()
-                else:
-                    # Dynamic mode
-                    if (self.max_kernels is not None) and (len(self.kernels) >= self.max_kernels):
-                        self.kernels.pop(0)
-                    self.kernels.append(kernel)
-                    self.kernel_counter += 1
-                    if (self.kernel_counter % self.rebuild_every) == 0:
-                        self._updateBiasExpression()
-                        simulation.context.reinitialize(preserveState=True)
+                # Rebuild bias expression (not every step for efficiency)
+                if self.kernel_counter % 10 == 0:
+                    self._updateBiasExpression()
+                    simulation.context.reinitialize(preserveState=True)
 
                 # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
                     self.saveKernels()
 
     def saveKernels(self):
-        """Save kernel information to file in plain text and numpy compressed format."""
+        """Save kernel information to file."""
 
         if not self.biasDir:
             return
@@ -473,28 +420,25 @@ class OPES:
         txt_name = os.path.join(self.biasDir, f"kernels_{self.step_count}.txt")
         npz_name = os.path.join(self.biasDir, f"kernels_{self.step_count}.npz")
 
-        # Use slot_kernel_map in capacity mode, otherwise use kernels
-        if self.capacity and self.capacity > 0:
-            kernels_to_save = self.slot_kernel_map
-        else:
-            kernels_to_save = self.kernels
-
         with open(txt_name, 'w') as f:
             f.write(f"# OPES Kernels at step {self.step_count}\n")
             f.write(f"# Temperature: {self.kT} kJ/mol\n")
-            f.write(f"# Barrier: {self.barrier}\n")
+            f.write(f"# Barrier: {self.barrier} kJ/mol\n")
+            f.write(f"# Bias factor: {self.bias_factor}\n")
+            f.write(f"# Epsilon: {self.epsilon}\n")
+            f.write(f"# Z_n: {self.Zn}\n")
             f.write("# Columns: ")
             for i in range(self.num_cvs):
                 f.write(f"cv{i} ")
-            f.write("height Z\n")
-            for kernel in kernels_to_save:
+            f.write("weight height\n")
+
+            for kernel in self.kernels:
                 f.write(" ".join(map(str, kernel)) + "\n")
 
-        # save a binary snapshot
-        np.savez_compressed(npz_name, kernels=np.array(kernels_to_save))
+        np.savez_compressed(npz_name, kernels=np.array(self.kernels))
 
     def loadKernels(self, filename):
-        """Load kernels from a plain text or numpy npz file."""
+        """Load kernels from file."""
 
         self.kernels = []
         if filename.endswith('.npz'):
@@ -511,22 +455,19 @@ class OPES:
                     if len(values) == self.num_cvs + 2:
                         self.kernels.append(values)
 
+        # Recalculate statistics
+        self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
+        self.sum_weights_sq = sum(k[self.num_cvs]**2 for k in self.kernels)
+        self._updateZn()
         self._updateBiasExpression()
+
         print(f"Loaded {len(self.kernels)} kernels from {filename}")
 
     def getFreeEnergy(self, cv_grid):
         """
-        Estimate free energy on a grid (kJ/mol).
+        Estimate free energy on a grid.
 
-        Parameters
-        ----------
-        cv_grid : list of arrays
-            Grid points for each CV (numeric, in the same units as the CVs)
-
-        Returns
-        -------
-        free_energy : array
-            Estimated free energy on the grid (kJ/mol), minimum shifted to 0
+        F(s) = -kT * log(P(s))
         """
 
         grids = np.meshgrid(*cv_grid, indexing='ij')
@@ -536,26 +477,13 @@ class OPES:
 
         free_energy = np.zeros(len(cv_points))
         for i, point in enumerate(cv_points):
-            bias = self._evaluateBias(point)
-            free_energy[i] = -bias
+            prob = self._evaluateProbability(point)
+            if prob > 0:
+                free_energy[i] = -self.kT * math.log(prob)
+            else:
+                free_energy[i] = np.inf
 
         free_energy = free_energy.reshape(shape)
-        free_energy -= np.min(free_energy)
+        free_energy -= np.nanmin(free_energy)
+
         return free_energy
-
-    def _periodic_difference(self, value, center, cv_index):
-        """Calculate periodic difference for a CV (returns float).
-
-        Wraps to the interval [-period/2, period/2].
-        """
-
-        if self.periodic[cv_index] is None:
-            return float(value - center)
-
-        period_min, period_max = self.periodic[cv_index]
-        period = period_max - period_min
-
-        diff = float(value - center)
-        # wrap using rounding
-        diff = diff - period * round(diff / period)
-        return float(diff)
