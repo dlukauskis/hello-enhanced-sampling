@@ -329,11 +329,11 @@ class OPES:
                 for j in range(self.num_cvs):
                     diff = self._periodic_difference(kernel[j], comp_kernel[j], j)
                     sigma_j = self.sigma_vals[j]
-                    dist2 += (diff / sigma_j)**2
+                    dist2 += (diff / sigma_j) ** 2
                 dist = math.sqrt(dist2)
 
                 if dist < self.compression_threshold:
-                    # Merge: add weights (heights are the same since sigma is global)
+                    # Merge: add weights
                     comp_kernel[self.num_cvs] += kernel[self.num_cvs]
                     placed = True
                     break
@@ -345,12 +345,40 @@ class OPES:
         self.kernels = compressed
         new_count = len(self.kernels)
 
-        # Recalculate sum_weights after compression
-        self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
-        self.sum_weights_sq = sum(k[self.num_cvs]**2 for k in self.kernels)
-
         if new_count < old_count:
             print(f"OPES: Compressed {old_count} kernels to {new_count}")
+
+        # Cap total kernels AFTER compression
+        max_kernels = 500
+        if len(self.kernels) > max_kernels:
+            # Keep most recent kernels
+            self.kernels = self.kernels[-max_kernels:]
+            print(f"OPES: Capped kernels at {max_kernels}")
+
+        # **CRITICAL**: Recalculate statistics AFTER capping
+        self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
+        self.sum_weights_sq = sum(k[self.num_cvs] ** 2 for k in self.kernels)
+
+
+    def _createBiasForce(self):
+        """Create the CustomCVForce with updatable parameters."""
+
+        # Start with a dummy expression
+        self.force = CustomCVForce("bias_scale*bias_offset")
+
+        for i, var in enumerate(self.variables):
+            self.force.addCollectiveVariable(f"cv{i}", var)
+
+        # Add global parameters that we can update without reinitializing
+        self.force.addGlobalParameter("bias_scale", 1.0)
+        self.force.addGlobalParameter("bias_offset", 0.0)
+
+        self.force.setForceGroup(15)
+        self.system.addForce(self.force)
+
+        # We'll update the actual expression separately
+        self.last_expression_update = 0
+
 
     def step(self, simulation, steps):
         """Advance the simulation while depositing OPES kernels."""
@@ -387,23 +415,27 @@ class OPES:
 
                 # Update statistics
                 self.sum_weights += weight
-                self.sum_weights_sq += weight**2
+                self.sum_weights_sq += weight ** 2
 
                 # Update Z_n
                 self._updateZn()
 
-                # Adapt bandwidth periodically
+                # Compress kernels periodically BEFORE updating bias
                 if self.kernel_counter % 100 == 0:
                     self._adaptBandwidth()
-
-                # Compress kernels periodically
-                if self.kernel_counter % 100 == 0:
                     self._compressKernels()
 
-                # Rebuild bias expression (not every step for efficiency)
-                if self.kernel_counter % 10 == 0:
+                # Update expression less frequently (every 50 kernels = 25,000 steps)
+                if self.kernel_counter - self.last_expression_update >= 50:
                     self._updateBiasExpression()
                     simulation.context.reinitialize(preserveState=True)
+                    self.last_expression_update = self.kernel_counter
+                else:
+                    # Just update the offset via parameters (FAST!)
+                    # Approximate: bias is roughly constant shape, just shifts
+                    context = simulation.context
+                    self.force.setGlobalParameterDefaultValue(0, 1.0)  # bias_scale
+                    self.force.updateParametersInContext(context)
 
                 # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
