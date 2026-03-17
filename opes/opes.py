@@ -145,17 +145,6 @@ class OPES:
         self.sum_weights = 0.0
         self.sum_weights_sq = 0.0
 
-    def _createBiasForce(self):
-        """Create the CustomCVForce for OPES bias."""
-
-        self.force = CustomCVForce("0")
-
-        for i, var in enumerate(self.variables):
-            self.force.addCollectiveVariable(f"cv{i}", var)
-
-        self.force.setForceGroup(15)
-        self.system.addForce(self.force)
-
     def _periodic_difference(self, value, center, cv_index):
         """Calculate periodic difference for a CV."""
 
@@ -176,35 +165,16 @@ class OPES:
             h /= (self.sigma_vals[i] * math.sqrt(2.0 * math.pi))
         return h
 
-    def _evaluateProbability(self, cv_values):
-        """
-        Evaluate probability estimate at given CV values.
+    def _createBiasForce(self):
+        """Create the CustomCVForce for OPES bias."""
 
-        P(s) = Σ w_k * h_k * G(s, s_k) / Σ w_k
-        """
+        self.force = CustomCVForce("0")  # Start with zero bias
 
-        if len(self.kernels) == 0:
-            return 0.0  # Will be regularized by epsilon
+        for i, var in enumerate(self.variables):
+            self.force.addCollectiveVariable(f"cv{i}", var)
 
-        weighted_sum = 0.0
-
-        for kernel in self.kernels:
-            # Gaussian kernel (already normalized by height)
-            gaussian = 1.0
-            for j in range(self.num_cvs):
-                center = kernel[j]
-                sigma_j = self.sigma_vals[j]
-                diff = self._periodic_difference(cv_values[j], center, j)
-                gaussian *= math.exp(-0.5 * (diff / sigma_j)**2)
-
-            weight = kernel[self.num_cvs]      # w_k
-            height = kernel[self.num_cvs + 1]  # h_k (normalization)
-
-            weighted_sum += weight * height * gaussian
-
-        # Normalize by sum of weights
-        prob_estimate = weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
-        return prob_estimate
+        self.force.setForceGroup(15)
+        self.system.addForce(self.force)
 
     def _evaluateBias(self, cv_values):
         """
@@ -359,26 +329,30 @@ class OPES:
         self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
         self.sum_weights_sq = sum(k[self.num_cvs] ** 2 for k in self.kernels)
 
+    def _evaluateProbability(self, cv_values):
+        """
+        Evaluate probability estimate at given CV values.
+        P(s) = Σ w_k * h_k * G(s, s_k) / Σ w_k
+        """
 
-    def _createBiasForce(self):
-        """Create the CustomCVForce with updatable parameters."""
+        if len(self.kernels) == 0:
+            return 0.0
 
-        # Start with a dummy expression
-        self.force = CustomCVForce("bias_scale*bias_offset")
+        weighted_sum = 0.0
+        for kernel in self.kernels:
+            gaussian = 1.0
+            for j in range(self.num_cvs):
+                center = kernel[j]
+                sigma_j = self.sigma_vals[j]
+                diff = self._periodic_difference(cv_values[j], center, j)
+                gaussian *= math.exp(-0.5 * (diff / sigma_j) ** 2)
 
-        for i, var in enumerate(self.variables):
-            self.force.addCollectiveVariable(f"cv{i}", var)
+            weight = kernel[self.num_cvs]
+            height = kernel[self.num_cvs + 1]
+            weighted_sum += weight * height * gaussian
 
-        # Add global parameters that we can update without reinitializing
-        self.force.addGlobalParameter("bias_scale", 1.0)
-        self.force.addGlobalParameter("bias_offset", 0.0)
-
-        self.force.setForceGroup(15)
-        self.system.addForce(self.force)
-
-        # We'll update the actual expression separately
-        self.last_expression_update = 0
-
+        prob = weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
+        return prob
 
     def step(self, simulation, steps):
         """Advance the simulation while depositing OPES kernels."""
@@ -413,6 +387,9 @@ class OPES:
                 self.kernels.append(kernel)
                 self.kernel_counter += 1
 
+                # Invalidate cache
+                self._cache_valid = False
+
                 # Update statistics
                 self.sum_weights += weight
                 self.sum_weights_sq += weight ** 2
@@ -425,17 +402,9 @@ class OPES:
                     self._adaptBandwidth()
                     self._compressKernels()
 
-                # Update expression less frequently (every 50 kernels = 25,000 steps)
-                if self.kernel_counter - self.last_expression_update >= 50:
+                if self.kernel_counter % 10 == 0:
                     self._updateBiasExpression()
                     simulation.context.reinitialize(preserveState=True)
-                    self.last_expression_update = self.kernel_counter
-                else:
-                    # Just update the offset via parameters (FAST!)
-                    # Approximate: bias is roughly constant shape, just shifts
-                    context = simulation.context
-                    self.force.setGlobalParameterDefaultValue(0, 1.0)  # bias_scale
-                    self.force.updateParametersInContext(context)
 
                 # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):

@@ -11,7 +11,7 @@ from opes_reporter import OPESCVReporter
 # total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings with wt-metad
 total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings with wt-metad
 # total_steps = 5000  # 0.01 ns with 2 fs timestep, just a smoke test
-kernel_pace = 100
+kernel_pace = 500
 stride = 500
 
 
