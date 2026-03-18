@@ -425,6 +425,8 @@ class OPES:
             f.write(f"# Bias factor: {self.bias_factor}\n")
             f.write(f"# Epsilon: {self.epsilon}\n")
             f.write(f"# Z_n: {self.Zn}\n")
+            f.write(f"# Sum_weights: {self.sum_weights}\n")
+            f.write(f"# Sigma_vals: {' '.join(str(s) for s in self.sigma_vals)}\n")
             f.write("# Columns: ")
             for i in range(self.num_cvs):
                 f.write(f"cv{i} ")
@@ -433,7 +435,14 @@ class OPES:
             for kernel in self.kernels:
                 f.write(" ".join(map(str, kernel)) + "\n")
 
-        np.savez_compressed(npz_name, kernels=np.array(self.kernels))
+        np.savez_compressed(
+            npz_name,
+            kernels=np.array(self.kernels),
+            sigma_vals=np.array(self.sigma_vals),
+            sum_weights=np.array(self.sum_weights),
+            kT=np.array(self.kT),
+            Zn=np.array(self.Zn),
+        )
 
     def loadKernels(self, filename):
         """Load kernels from file."""

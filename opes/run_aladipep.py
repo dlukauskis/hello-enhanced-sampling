@@ -7,9 +7,10 @@ import opes
 import numpy as np
 import os
 from opes_reporter import OPESCVReporter
+from plot_fes_opes import main as plot_fes_opes
 
-# total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings with wt-metad
-total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings with wt-metad
+total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings with wt-metad
+# total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings with wt-metad
 # total_steps = 5000  # 0.01 ns with 2 fs timestep, just a smoke test
 kernel_pace = 500
 stride = 500
@@ -79,4 +80,10 @@ np.savez_compressed(fes_out_fpath, fes=fes, grid0=cv_grid[0], grid1=cv_grid[1])
 if opes_bias.biasDir:
     opes_bias.saveKernels()
 
-# TODO: finish this analysis/CV/FES/deltaF evolution with time figure with subplots, like the wt-metaD example
+# Show the same 4-panel results figure as the wt-metaD example:
+#   (1) CV evolution, (2) 2D FES, (3) 1D FES convergence, (4) ΔF over time
+plot_fes_opes(
+    output_dir=opes_bias.biasDir,
+    fig_fname=os.path.join(opes_bias.biasDir, 'opes-aladipep-results.png'),
+    periodic=[(-np.pi, np.pi), (-np.pi, np.pi)],
+)
