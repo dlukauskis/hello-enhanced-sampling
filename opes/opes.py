@@ -7,7 +7,8 @@ Reference: Invernizzi & Parrinello, J. Phys. Chem. Lett. 2020, 11, 2731-2736
 import math
 import numpy as np
 import os
-from openmm import CustomCVForce
+from typing import Tuple, cast
+from openmm import CustomCVForce, Continuous2DFunction
 from openmm import unit
 
 
@@ -105,6 +106,11 @@ class OPES:
         self.saveFrequency = int(saveFrequency)
         self.biasDir = biasDir
         self.adaptive_sigma = adaptive_sigma
+        self.use_tabulated_bias = self.num_cvs == 2 and all(p is not None for p in self.periodic)
+        self.bias_grid_points = 96
+        self.bias_update_stride = 10
+        self.bias_function = None
+        self.bias_grid = None
 
         # Initial bandwidth (sigma)
         if sigma is None:
@@ -120,10 +126,9 @@ class OPES:
 
         for i, s in enumerate(self.sigma):
             if hasattr(s, 'unit'):
-                if self.periodic[i] is not None:
-                    val = s.value_in_unit(unit.radian)
-                else:
-                    val = s.value_in_unit(unit.nanometer)
+                # This OPES implementation is used for torsion CVs in this repo.
+                # Keep the conversion simple and consistent across periodic CVs.
+                val = s.value_in_unit(unit.radian)
             else:
                 val = float(s)
             self.sigma0_vals.append(float(np.abs(val)))
@@ -149,14 +154,15 @@ class OPES:
         """Calculate periodic difference for a CV."""
 
         if self.periodic[cv_index] is None:
-            return float(value - center)
+            delta = value - center
+            return float(delta) if np.isscalar(delta) else delta
 
         period_min, period_max = self.periodic[cv_index]
         period = period_max - period_min
 
-        diff = float(value - center)
-        diff = diff - period * round(diff / period)
-        return float(diff)
+        diff = value - center
+        diff = diff - period * np.round(diff / period)
+        return float(diff) if np.isscalar(diff) else diff
 
     def _gaussian_height(self):
         """Calculate Gaussian normalization height: h = 1/[(2π)^(d/2) * Π σ_i]"""
@@ -165,10 +171,122 @@ class OPES:
             h /= (self.sigma_vals[i] * math.sqrt(2.0 * math.pi))
         return h
 
+    def _kernel_sigma(self, kernel):
+        """Return the per-kernel sigma vector from a stored kernel row."""
+        if len(kernel) >= 2 * self.num_cvs + 2:
+            return [float(kernel[self.num_cvs + i]) for i in range(self.num_cvs)]
+        return list(self.sigma_vals)
+
+    def _kernel_weight(self, kernel):
+        return float(kernel[2 * self.num_cvs]) if len(kernel) >= 2 * self.num_cvs + 2 else float(kernel[self.num_cvs])
+
+    def _kernel_height(self, kernel):
+        return float(kernel[2 * self.num_cvs + 1]) if len(kernel) >= 2 * self.num_cvs + 2 else float(kernel[self.num_cvs + 1])
+
+    def _kernel_center(self, kernel):
+        return [float(kernel[i]) for i in range(self.num_cvs)]
+
+    def _kernel_periodic_difference(self, value, center, cv_index):
+        return self._periodic_difference(value, center, cv_index)
+
+    def _kernel_row(self, cv_values, sigma_vals, weight, height):
+        return [float(v) for v in cv_values] + [float(s) for s in sigma_vals] + [float(weight), float(height)]
+
+    def _evaluate_probability_kernel_set(self, cv_values, kernels=None):
+        """Evaluate the KDE probability using the stored kernel set."""
+        if kernels is None:
+            kernels = self.kernels
+        if len(kernels) == 0:
+            return 0.0
+
+        weighted_sum = 0.0
+        for kernel in kernels:
+            centers = self._kernel_center(kernel)
+            sigma_vals = self._kernel_sigma(kernel)
+            gaussian = 1.0
+            for j in range(self.num_cvs):
+                diff = self._periodic_difference(cv_values[j], centers[j], j)
+                gaussian *= math.exp(-0.5 * (diff / sigma_vals[j]) ** 2)
+
+            weighted_sum += self._kernel_weight(kernel) * self._kernel_height(kernel) * gaussian
+
+        return weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
+
+    def _build_bias_table(self):
+        """Build a 2D tabulated bias from the current kernel set."""
+        if not self.use_tabulated_bias:
+            return None
+
+        periodic0 = cast(Tuple[float, float], self.periodic[0])
+        periodic1 = cast(Tuple[float, float], self.periodic[1])
+        x_min = periodic0[0]
+        x_max = periodic0[1]
+        y_min = periodic1[0]
+        y_max = periodic1[1]
+
+        if self.bias_grid is None:
+            self.bias_grid = (
+                np.linspace(x_min, x_max, self.bias_grid_points),
+                np.linspace(y_min, y_max, self.bias_grid_points),
+            )
+
+        x_grid, y_grid = self.bias_grid
+        X, Y = np.meshgrid(x_grid, y_grid)
+        prob = np.zeros_like(X)
+
+        for kernel in self.kernels:
+            centers = self._kernel_center(kernel)
+            sigma_vals = self._kernel_sigma(kernel)
+            dx = self._periodic_difference(X, centers[0], 0)
+            dy = self._periodic_difference(Y, centers[1], 1)
+            prob += self._kernel_weight(kernel) * self._kernel_height(kernel) * np.exp(
+                -0.5 * ((dx / sigma_vals[0]) ** 2 + (dy / sigma_vals[1]) ** 2)
+            )
+
+        if self.sum_weights > 0:
+            prob /= self.sum_weights
+
+        regularized = prob / max(self.Zn, 1.0) + self.epsilon
+        regularized = np.clip(regularized, self.epsilon, None)
+        coeff = (1.0 - 1.0 / self.bias_factor) * self.kT
+        bias = coeff * np.log(regularized)
+        bias -= np.min(bias)
+
+        # Continuous2DFunction(periodic=True) requires the first and last
+        # tabulated points along each axis to match exactly. Enforce that here
+        # so the spline constructor does not fail near the periodic boundary.
+        bias[0, :] = bias[-1, :] = 0.5 * (bias[0, :] + bias[-1, :])
+        bias[:, 0] = bias[:, -1] = 0.5 * (bias[:, 0] + bias[:, -1])
+        corner = float(np.mean([bias[0, 0], bias[0, -1], bias[-1, 0], bias[-1, -1]]))
+        bias[0, 0] = bias[0, -1] = bias[-1, 0] = bias[-1, -1] = corner
+
+        # Continuous2DFunction expects a flat list of z values.
+        return bias.ravel(order='C')
+
     def _createBiasForce(self):
         """Create the CustomCVForce for OPES bias."""
 
-        self.force = CustomCVForce("0")  # Start with zero bias
+        if self.use_tabulated_bias:
+            periodic0 = cast(Tuple[float, float], self.periodic[0])
+            periodic1 = cast(Tuple[float, float], self.periodic[1])
+            x_min = periodic0[0]
+            x_max = periodic0[1]
+            y_min = periodic1[0]
+            y_max = periodic1[1]
+            self.bias_function = Continuous2DFunction(
+                self.bias_grid_points,
+                self.bias_grid_points,
+                np.zeros(self.bias_grid_points * self.bias_grid_points),
+                x_min,
+                x_max,
+                y_min,
+                y_max,
+                True,
+            )
+            self.force = CustomCVForce("bias(cv0,cv1)")
+            self.force.addTabulatedFunction("bias", self.bias_function)
+        else:
+            self.force = CustomCVForce("0")  # Start with zero bias
 
         for i, var in enumerate(self.variables):
             self.force.addCollectiveVariable(f"cv{i}", var)
@@ -183,7 +301,7 @@ class OPES:
         V(s) = (1 - 1/γ) * kT * log(P(s)/Z_n + ε)
         """
 
-        prob = self._evaluateProbability(cv_values)
+        prob = self._evaluate_probability_kernel_set(cv_values)
 
         # Regularized probability: P/Z + ε
         regularized_prob = prob / self.Zn + self.epsilon
@@ -201,29 +319,50 @@ class OPES:
         """
         Update Z_n: normalization over explored CV space.
 
-        Z_n estimates the volume of CV space that has been explored.
-        Simple estimate: Z_n = effective_sample_size
+        Keep this intentionally cheap: unlike the full PLUMED overlap-based
+        update, this Python implementation uses an effective-sample-size proxy.
+        This avoids an O(N^2) kernel overlap sum on every deposition.
         """
-
-        # Effective sample size: N_eff = (Σ w_k)^2 / Σ w_k^2
         if self.sum_weights_sq > 0:
-            N_eff = self.sum_weights**2 / self.sum_weights_sq
-            self.Zn = max(1.0, N_eff)
+            self.Zn = max(1.0, self.sum_weights ** 2 / self.sum_weights_sq)
         else:
             self.Zn = 1.0
 
-    def _updateBiasExpression(self):
+    def _updateBiasExpression(self, context=None):
         """
         Update the bias energy expression.
 
         V(s) = (1-1/γ) * kT * log(P(s)/Z_n + ε)
         """
 
+        if self.use_tabulated_bias:
+            if self.bias_function is None:
+                return
+            periodic0 = self.periodic[0]
+            periodic1 = self.periodic[1]
+            assert periodic0 is not None and periodic1 is not None
+            values = self._build_bias_table()
+            if values is None:
+                return
+            self.bias_function.setFunctionParameters(
+                self.bias_grid_points,
+                self.bias_grid_points,
+                values,
+                periodic0[0],
+                periodic0[1],
+                periodic1[0],
+                periodic1[1]
+            )
+            if context is not None:
+                self.force.updateParametersInContext(context)
+            return
+
         if len(self.kernels) == 0:
-            # No kernels yet: V = (1-1/γ) * kT * log(ε)
             coeff = (1.0 - 1.0/self.bias_factor) * self.kT
             bias_expr = f"{coeff:.12g}*{math.log(self.epsilon):.12g}"
             self.force.setEnergyFunction(bias_expr)
+            if context is not None:
+                self.force.updateParametersInContext(context)
             return
 
         # Build kernel sum expression: Σ w_k * h_k * G(s,s_k)
@@ -232,22 +371,26 @@ class OPES:
         for kernel in self.kernels:
             # Gaussian terms for each CV
             gaussian_terms = []
+            centers = self._kernel_center(kernel)
+            sigma_vals = self._kernel_sigma(kernel)
             for j in range(self.num_cvs):
-                center = float(kernel[j])
-                sigma_j = float(self.sigma_vals[j])
+                center = float(centers[j])
+                sigma_j = float(sigma_vals[j])
 
                 if self.periodic[j] is None:
                     diff = f"(cv{j}-{center:.12g})"
                 else:
-                    pmin, pmax = self.periodic[j]
+                    periodic = cast(Tuple[float, float], self.periodic[j])
+                    pmin = periodic[0]
+                    pmax = periodic[1]
                     period = pmax - pmin
                     diff = f"((cv{j}-{center:.12g})-{period:.12g}*floor(((cv{j}-{center:.12g})/{period:.12g})+0.5))"
 
                 gaussian_terms.append(f"(({diff})^2/{(sigma_j**2):.12g})")
 
             gaussian_expr = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
-            weight = float(kernel[self.num_cvs])
-            height = float(kernel[self.num_cvs + 1])
+            weight = self._kernel_weight(kernel)
+            height = self._kernel_height(kernel)
 
             kernel_terms.append(f"({weight:.12g}*{height:.12g}*{gaussian_expr})")
 
@@ -262,6 +405,8 @@ class OPES:
         bias_expr = f"{coeff:.12g}*log({regularized_expr})"
 
         self.force.setEnergyFunction(bias_expr)
+        if context is not None:
+            self.force.updateParametersInContext(context)
 
     def _adaptBandwidth(self):
         """
@@ -298,13 +443,51 @@ class OPES:
                 dist2 = 0.0
                 for j in range(self.num_cvs):
                     diff = self._periodic_difference(kernel[j], comp_kernel[j], j)
-                    sigma_j = self.sigma_vals[j]
+                    sigma_j = self._kernel_sigma(comp_kernel)[j]
                     dist2 += (diff / sigma_j) ** 2
                 dist = math.sqrt(dist2)
 
                 if dist < self.compression_threshold:
-                    # Merge: add weights
-                    comp_kernel[self.num_cvs] += kernel[self.num_cvs]
+                    # Merge full kernel state (center, sigma, weight, height)
+                    w1 = self._kernel_weight(comp_kernel)
+                    w2 = self._kernel_weight(kernel)
+                    h1 = self._kernel_height(comp_kernel)
+                    h2 = self._kernel_height(kernel)
+                    tot_w = w1 + w2
+
+                    for j in range(self.num_cvs):
+                        c1 = float(comp_kernel[j])
+                        c2 = float(kernel[j])
+                        periodic = self.periodic[j]
+                        if periodic is not None:
+                            c1 = c2 + self._periodic_difference(c1, c2, j)
+                        merged_c = (w1 * c1 + w2 * c2) / tot_w
+                        if periodic is not None:
+                            pmin = periodic[0]
+                            pmax = periodic[1]
+                            period = pmax - pmin
+                            merged_c = pmin + ((merged_c - pmin) % period)
+                        comp_kernel[j] = merged_c
+
+                    sigma1 = self._kernel_sigma(comp_kernel)
+                    sigma2 = self._kernel_sigma(kernel)
+                    merged_sigma = []
+                    for j in range(self.num_cvs):
+                        s1 = sigma1[j]
+                        s2 = sigma2[j]
+                        c1 = float(comp_kernel[j])
+                        c2 = float(kernel[j])
+                        ss = (w1 * (s1 * s1 + c1 * c1) + w2 * (s2 * s2 + c2 * c2)) / tot_w - ((w1 * c1 + w2 * c2) / tot_w) ** 2
+                        merged_sigma.append(max(1e-8, math.sqrt(max(ss, 1e-16))))
+
+                    if len(comp_kernel) >= 2 * self.num_cvs + 2:
+                        for j in range(self.num_cvs):
+                            comp_kernel[self.num_cvs + j] = merged_sigma[j]
+                        comp_kernel[2 * self.num_cvs] = tot_w
+                        comp_kernel[2 * self.num_cvs + 1] = (w1 * h1 + w2 * h2) / tot_w
+                    else:
+                        # Backward-compatible fallback: old kernel rows only store weight/height.
+                        comp_kernel[self.num_cvs] += kernel[self.num_cvs]
                     placed = True
                     break
 
@@ -326,8 +509,8 @@ class OPES:
             print(f"OPES: Capped kernels at {max_kernels}")
 
         # **CRITICAL**: Recalculate statistics AFTER capping
-        self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
-        self.sum_weights_sq = sum(k[self.num_cvs] ** 2 for k in self.kernels)
+        self.sum_weights = sum(self._kernel_weight(k) for k in self.kernels)
+        self.sum_weights_sq = sum(self._kernel_weight(k) ** 2 for k in self.kernels)
 
     def _evaluateProbability(self, cv_values):
         """
@@ -335,24 +518,7 @@ class OPES:
         P(s) = Σ w_k * h_k * G(s, s_k) / Σ w_k
         """
 
-        if len(self.kernels) == 0:
-            return 0.0
-
-        weighted_sum = 0.0
-        for kernel in self.kernels:
-            gaussian = 1.0
-            for j in range(self.num_cvs):
-                center = kernel[j]
-                sigma_j = self.sigma_vals[j]
-                diff = self._periodic_difference(cv_values[j], center, j)
-                gaussian *= math.exp(-0.5 * (diff / sigma_j) ** 2)
-
-            weight = kernel[self.num_cvs]
-            height = kernel[self.num_cvs + 1]
-            weighted_sum += weight * height * gaussian
-
-        prob = weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
-        return prob
+        return self._evaluate_probability_kernel_set(cv_values)
 
     def step(self, simulation, steps):
         """Advance the simulation while depositing OPES kernels."""
@@ -382,8 +548,8 @@ class OPES:
                 # Gaussian height (normalization factor)
                 height = self._gaussian_height()
 
-                # Deposit kernel: [cv0, cv1, ..., weight, height]
-                kernel = cv_values + [weight, height]
+                # Deposit kernel: [cv0, cv1, ..., sigma0, sigma1, ..., weight, height]
+                kernel = self._kernel_row(cv_values, self.sigma_vals, weight, height)
                 self.kernels.append(kernel)
                 self.kernel_counter += 1
 
@@ -399,9 +565,10 @@ class OPES:
                     self._adaptBandwidth()
                     self._compressKernels()
 
-                if self.kernel_counter % 10 == 0:
-                    self._updateBiasExpression()
-                    simulation.context.reinitialize(preserveState=True)
+                # Rebuild the tabulated bias only periodically; the
+                # deposition math still uses the current kernel set every time.
+                if (not self.use_tabulated_bias) or (self.kernel_counter % self.bias_update_stride == 0) or self.kernel_counter == 1:
+                    self._updateBiasExpression(simulation.context)
 
                 # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
@@ -430,6 +597,8 @@ class OPES:
             f.write("# Columns: ")
             for i in range(self.num_cvs):
                 f.write(f"cv{i} ")
+            for i in range(self.num_cvs):
+                f.write(f"sigma{i} ")
             f.write("weight height\n")
 
             for kernel in self.kernels:
@@ -459,12 +628,12 @@ class OPES:
                     if line.startswith('#') or not line.strip():
                         continue
                     values = list(map(float, line.split()))
-                    if len(values) == self.num_cvs + 2:
+                    if len(values) in (self.num_cvs + 2, 2 * self.num_cvs + 2):
                         self.kernels.append(values)
 
         # Recalculate statistics
-        self.sum_weights = sum(k[self.num_cvs] for k in self.kernels)
-        self.sum_weights_sq = sum(k[self.num_cvs]**2 for k in self.kernels)
+        self.sum_weights = sum(self._kernel_weight(k) for k in self.kernels)
+        self.sum_weights_sq = sum(self._kernel_weight(k)**2 for k in self.kernels)
         self._updateZn()
         self._updateBiasExpression()
 
