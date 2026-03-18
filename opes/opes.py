@@ -387,9 +387,6 @@ class OPES:
                 self.kernels.append(kernel)
                 self.kernel_counter += 1
 
-                # Invalidate cache
-                self._cache_valid = False
-
                 # Update statistics
                 self.sum_weights += weight
                 self.sum_weights_sq += weight ** 2

@@ -78,3 +78,5 @@ np.savez_compressed(fes_out_fpath, fes=fes, grid0=cv_grid[0], grid1=cv_grid[1])
 # save kernels and cv history
 if opes_bias.biasDir:
     opes_bias.saveKernels()
+
+# TODO: finish this analysis/CV/FES/deltaF evolution with time figure with subplots, like the wt-metaD example
