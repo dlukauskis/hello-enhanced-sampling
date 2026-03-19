@@ -1,23 +1,24 @@
 from sys import stdout
+from typing import Any, cast
 
 from openmm import *
 from openmm.app import *
-from openmm.unit import kelvin, kilojoules_per_mole, picosecond, radian
+import openmm.unit as unit
 import opes
 import numpy as np
 import os
 from opes_reporter import OPESCVReporter
 from plot_fes_opes import main as plot_fes_opes
 
-# total_steps = 2500000  # 5 ns with 2 fs timestep, enough for 5-10 crossings with wt-metad
-total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 crossings with wt-metad
+# total_steps = 2500000  # 5 ns with 2 fs timestep, comparable to wt-metad reference
+total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 recrossings in wt-metad
 # total_steps = 5000  # 0.01 ns with 2 fs timestep, just a smoke test
 kernel_pace = 500
 stride = 500
 
 
 # Create a System for alanine dipeptide in vacuo
-pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
+pdb_file = cast(Any, PDBFile)('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
 
 system = forcefield.createSystem(
@@ -36,9 +37,9 @@ cv2.addTorsion(6, 8, 14, 16)
 opes_bias = opes.OPES(
     system=system,
     variables=[cv1, cv2],
-    temperature=300 * kelvin,
-    barrier=40 * kilojoules_per_mole,
-    sigma=[0.35 * radian, 0.35 * radian],
+    temperature=300 * unit.kelvin,
+    barrier=40 * unit.kilojoules_per_mole,
+    sigma=[0.35 * unit.radian, 0.35 * unit.radian],
     stride=kernel_pace,
     saveFrequency=stride,
     biasDir='output',
@@ -47,7 +48,7 @@ opes_bias = opes.OPES(
 
 # Run simulation
 integrator = LangevinIntegrator(
-    300 * kelvin, 1.0 / picosecond, 0.002 * picosecond,
+    300 * unit.kelvin, 1.0 / unit.picosecond, 0.002 * unit.picosecond,
 )
 simulation = Simulation(pdb_file.topology, system, integrator)
 simulation.context.setPositions(pdb_file.positions)

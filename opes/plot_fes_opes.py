@@ -99,6 +99,9 @@ def main(
             snap['kT'],
             cv_grid,
             periodic=periodic,
+            barrier=snap.get('barrier'),
+            bias_factor=snap.get('bias_factor'),
+            kernel_cutoff=snap.get('kernel_cutoff'),
         )
         fes_all.append(fes)
 

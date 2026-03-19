@@ -38,6 +38,31 @@ def _sigma_from_height(height, n_cvs, equal_sigma=True):
     return [sigma] * n_cvs
 
 
+def _read_kernel_metadata(txt_path):
+    """Read barrier/bias-factor metadata from a kernel text file header."""
+    meta = {}
+    if not os.path.exists(txt_path):
+        return meta
+
+    with open(txt_path, 'r') as f:
+        for line in f:
+            if not line.startswith('#'):
+                break
+            if line.startswith('# Barrier:'):
+                meta['barrier'] = float(line.split(':', 1)[1].split()[0])
+            elif line.startswith('# Bias factor:'):
+                meta['bias_factor'] = float(line.split(':', 1)[1].split()[0])
+            elif line.startswith('# Z_n:'):
+                meta['Zn'] = float(line.split(':', 1)[1].split()[0])
+            elif line.startswith('# Sum_weights:'):
+                meta['sum_weights'] = float(line.split(':', 1)[1].split()[0])
+            elif line.startswith('# Kernel_cutoff:'):
+                meta['kernel_cutoff'] = float(line.split(':', 1)[1].split()[0])
+            elif line.startswith('# Sigma_vals:'):
+                meta['sigma_vals'] = [float(x) for x in line.split(':', 1)[1].split()]
+    return meta
+
+
 def load_opes_kernel_snapshots(output_dir, max_snapshots=None):
     """
     Load OPES kernel snapshots from *output_dir*.
@@ -76,16 +101,25 @@ def load_opes_kernel_snapshots(output_dir, max_snapshots=None):
     for fpath in files:
         step = int(os.path.basename(fpath).replace('kernels_', '').replace('.npz', ''))
         data = np.load(fpath, allow_pickle=True)
+        txt_meta = _read_kernel_metadata(fpath.replace('.npz', '.txt'))
 
         kernels = data['kernels']
         if len(kernels) == 0:
             continue
 
-        n_cvs = kernels.shape[1] - 2  # columns: cv0, cv1, ..., weight, height
+        # New-format files store [cv0, cv1, ..., sigma0, sigma1, ..., weight, height]
+        # Old-format files store [cv0, cv1, ..., weight, height]
+        has_sigma_cols = 'sigma_vals' in data or 'sigma_vals' in txt_meta or kernels.shape[1] > 4
+        if has_sigma_cols:
+            n_cvs = (kernels.shape[1] - 2) // 2
+        else:
+            n_cvs = kernels.shape[1] - 2
 
         # sigma_vals – new-format files store it directly
         if 'sigma_vals' in data:
             sigma_vals = data['sigma_vals'].tolist()
+        elif 'sigma_vals' in txt_meta:
+            sigma_vals = txt_meta['sigma_vals']
         else:
             # Back-compat: derive from the first height value (equal-sigma)
             height_sample = float(kernels[0, n_cvs + 1])
@@ -94,14 +128,20 @@ def load_opes_kernel_snapshots(output_dir, max_snapshots=None):
         # sum_weights
         if 'sum_weights' in data:
             sum_weights = float(data['sum_weights'])
+        elif 'sum_weights' in txt_meta:
+            sum_weights = float(txt_meta['sum_weights'])
         else:
             sum_weights = float(kernels[:, n_cvs].sum())
 
-        # kT
+        # kT / barrier / bias_factor
         if 'kT' in data:
             kT = float(data['kT'])
         else:
             kT = 2.494  # 300 K default
+
+        barrier = float(data['barrier']) if 'barrier' in data else txt_meta.get('barrier', 40.0)
+        bias_factor = float(data['bias_factor']) if 'bias_factor' in data else txt_meta.get('bias_factor', 1.0 + barrier / kT)
+        kernel_cutoff = float(data['kernel_cutoff']) if 'kernel_cutoff' in data else None
 
         snapshots.append({
             'step': step,
@@ -109,12 +149,15 @@ def load_opes_kernel_snapshots(output_dir, max_snapshots=None):
             'sigma_vals': sigma_vals,
             'sum_weights': sum_weights,
             'kT': kT,
+            'barrier': barrier,
+            'bias_factor': bias_factor,
+            'kernel_cutoff': kernel_cutoff,
         })
 
     return snapshots
 
 
-def reconstruct_fes_opes(kernels, sigma_vals, sum_weights, kT, cv_grid, periodic=None):
+def reconstruct_fes_opes(kernels, sigma_vals, sum_weights, kT, cv_grid, periodic=None, barrier=None, bias_factor=None, kernel_cutoff=None):
     """
     Reconstruct the FES from a set of OPES kernels on a 2-CV grid.
 
@@ -146,6 +189,20 @@ def reconstruct_fes_opes(kernels, sigma_vals, sum_weights, kT, cv_grid, periodic
     if periodic is None:
         periodic = [None] * n_cvs
 
+    has_sigma_cols = kernels.shape[1] == 2 * n_cvs + 2
+    weight_idx = 2 * n_cvs if has_sigma_cols else n_cvs
+    height_idx = weight_idx + 1
+
+    if kernel_cutoff is None:
+        if barrier is None:
+            barrier = 40.0
+        if bias_factor is None:
+            bias_factor = 1.0 + barrier / kT
+        bias_prefactor = 1.0 - 1.0 / bias_factor
+        kernel_cutoff = math.sqrt(2.0 * barrier / (bias_prefactor * kT))
+    kernel_cutoff2 = kernel_cutoff ** 2
+    val_at_cutoff = math.exp(-0.5 * kernel_cutoff2)
+
     # xy meshgrid: shape (n_cv1, n_cv0)
     CV0, CV1 = np.meshgrid(cv_grid[0], cv_grid[1])
     grids = [CV0, CV1]
@@ -154,16 +211,19 @@ def reconstruct_fes_opes(kernels, sigma_vals, sum_weights, kT, cv_grid, periodic
 
     for kernel in kernels:
         centers = kernel[:n_cvs]
-        weight = float(kernel[n_cvs])
-        height = float(kernel[n_cvs + 1])
+        weight = float(kernel[weight_idx])
+        height = float(kernel[height_idx])
+        kernel_sigmas = [float(kernel[n_cvs + j]) for j in range(n_cvs)] if has_sigma_cols else list(sigma_vals)
 
-        gaussian = np.ones(CV0.shape)
+        norm2 = np.zeros(CV0.shape)
         for j in range(n_cvs):
             diff = grids[j] - float(centers[j])
             if periodic[j] is not None:
                 period = periodic[j][1] - periodic[j][0]
                 diff = diff - period * np.round(diff / period)
-            gaussian *= np.exp(-0.5 * (diff / sigma_vals[j]) ** 2)
+            norm2 += (diff / kernel_sigmas[j]) ** 2
+
+        gaussian = np.where(norm2 < kernel_cutoff2, np.exp(-0.5 * norm2) - val_at_cutoff, 0.0)
 
         prob += weight * height * gaussian
 
