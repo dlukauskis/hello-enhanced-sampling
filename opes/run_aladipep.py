@@ -1,5 +1,4 @@
 from sys import stdout
-from typing import Any, cast
 
 from openmm import *
 from openmm.app import *
@@ -10,15 +9,15 @@ import os
 from opes_reporter import OPESCVReporter
 from plot_fes_opes import main as plot_fes_opes
 
-# total_steps = 2500000  # 5 ns with 2 fs timestep, comparable to wt-metad reference
-total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 recrossings in wt-metad
+total_steps = 2500000  # 5 ns with 2 fs timestep, comparable to wt-metad reference
+# total_steps = 500000  # 1 ns with 2 fs timestep, enough for 1-2 recrossings in wt-metad
 # total_steps = 5000  # 0.01 ns with 2 fs timestep, just a smoke test
 kernel_pace = 500
 stride = 500
 
 
 # Create a System for alanine dipeptide in vacuo
-pdb_file = cast(Any, PDBFile)('../benchmark_systems/aladipep/system.pdb')
+pdb_file = PDBFile('../benchmark_systems/aladipep/system.pdb')
 forcefield = ForceField('amber14-all.xml')
 
 system = forcefield.createSystem(
