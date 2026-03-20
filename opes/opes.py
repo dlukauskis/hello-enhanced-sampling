@@ -110,6 +110,7 @@ class OPES:
 
         self.stride = int(stride)
         self.compression_threshold = compression_threshold
+        self.compression_threshold2 = compression_threshold ** 2
         self.saveFrequency = int(saveFrequency)
         self.biasDir = biasDir
         self.adaptive_sigma = adaptive_sigma
@@ -141,8 +142,9 @@ class OPES:
             self.sigma0_vals.append(float(np.abs(val)))
             self.sigma_vals.append(float(np.abs(val)))
 
-        # Storage for kernels: [cv0, cv1, ..., weight, height]
-        # height is for Gaussian normalization: h = 1/[(2π)^(d/2) * Π σ_i]
+        # Storage for kernels: [cv0, cv1, ..., sigma0, sigma1, ..., weight, height]
+        # weight carries the kernel amplitude (PLUMED's "height" after sigma
+        # rescaling); height is kept at 1.0 so that amplitude = weight * height.
         self.kernels = []
         self.kernel_counter = 0
 
@@ -153,10 +155,16 @@ class OPES:
         # Create the bias force
         self._createBiasForce()
 
-        # Statistics
+        # Statistics — sum_weights tracks the raw reweighting factors
+        # exp(V/kT) BEFORE sigma rescaling, matching PLUMED's sum_weights_.
         self.step_count = 0
         self.sum_weights = 0.0
         self.sum_weights_sq = 0.0
+
+        # PLUMED skips the very first update() call (useful for restarts).
+        self._is_first_step = True
+        # Counter of actual deposition calls (including the skipped first one)
+        self._counter = 0
 
     def _periodic_difference(self, value, center, cv_index):
         """Calculate periodic difference for a CV."""
@@ -171,20 +179,6 @@ class OPES:
         diff = value - center
         diff = diff - period * np.round(diff / period)
         return float(diff) if np.isscalar(diff) else diff
-
-    def _compute_kernel_height(self, log_weight, sigma_vals):
-        """Return the kernel height used by the PLUMED OPES reference.
-
-        The reference stores ``exp(log_weight)`` and rescales by ``sigma0/sigma``
-        when adaptive sigma is active. The usual Gaussian normalization constant
-        is intentionally omitted because it cancels in the OPES normalization.
-        """
-        height = math.exp(log_weight)
-        for sigma0, sigma in zip(self.sigma0_vals, sigma_vals):
-            if sigma <= 0:
-                raise ValueError("sigma values must stay positive")
-            height *= sigma0 / sigma
-        return height
 
     def _periodic_range(self, cv_index):
         periodic = self.periodic[cv_index]
@@ -213,8 +207,25 @@ class OPES:
     def _kernel_row(self, cv_values, sigma_vals, weight, height):
         return [float(v) for v in cv_values] + [float(s) for s in sigma_vals] + [float(weight), float(height)]
 
+    # ------------------------------------------------------------------
+    # Kernel amplitude helpers
+    # ------------------------------------------------------------------
+
+    def _kernel_amplitude(self, kernel):
+        """Effective amplitude of a stored kernel (weight × height)."""
+        return self._kernel_weight(kernel) * self._kernel_height(kernel)
+
+    # ------------------------------------------------------------------
+    # Kernel evaluation
+    # ------------------------------------------------------------------
+
     def _evaluate_probability_kernel_set(self, cv_values, kernels=None):
-        """Evaluate the KDE probability using the stored kernel set."""
+        """Evaluate the KDE probability using the stored kernel set.
+
+        Returns  sum(amplitude_k * G_k(s)) / sum_weights
+        where sum_weights tracks the raw reweighting factors (PLUMED's
+        KDEnorm = sum_weights_).
+        """
         if kernels is None:
             kernels = self.kernels
         if len(kernels) == 0:
@@ -234,7 +245,7 @@ class OPES:
             else:
                 gaussian = math.exp(-0.5 * norm2) - self.val_at_cutoff
 
-            weighted_sum += self._kernel_weight(kernel) * self._kernel_height(kernel) * gaussian
+            weighted_sum += self._kernel_amplitude(kernel) * gaussian
 
         return weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
 
@@ -248,7 +259,7 @@ class OPES:
             norm2 += (diff / sigma_vals[i]) ** 2
             if norm2 >= self.kernel_cutoff2:
                 return 0.0
-        return self._kernel_weight(kernel) * self._kernel_height(kernel) * (math.exp(-0.5 * norm2) - self.val_at_cutoff)
+        return self._kernel_amplitude(kernel) * (math.exp(-0.5 * norm2) - self.val_at_cutoff)
 
     def _build_bias_table(self):
         """Build a 2D tabulated bias from the current kernel set."""
@@ -275,11 +286,12 @@ class OPES:
         for kernel in self.kernels:
             centers = self._kernel_center(kernel)
             sigma_vals = self._kernel_sigma(kernel)
+            amp = self._kernel_amplitude(kernel)
             dx = self._periodic_difference(X, centers[0], 0)
             dy = self._periodic_difference(Y, centers[1], 1)
             norm2 = (dx / sigma_vals[0]) ** 2 + (dy / sigma_vals[1]) ** 2
             gaussian = np.where(norm2 < self.kernel_cutoff2, np.exp(-0.5 * norm2) - self.val_at_cutoff, 0.0)
-            prob += self._kernel_weight(kernel) * self._kernel_height(kernel) * gaussian
+            prob += amp * gaussian
 
         if self.sum_weights > 0:
             prob /= self.sum_weights
@@ -354,7 +366,10 @@ class OPES:
         return float(bias)
 
     def _updateZn(self):
-        """Update the exact PLUMED-style Zed normalization."""
+        """Update the exact PLUMED-style Zed normalization.
+
+        Zed = Σ_k Σ_{k'} evaluateKernel(k', center_k) / (KDEnorm × N_kernels)
+        """
         if len(self.kernels) == 0 or self.sum_weights <= 0:
             self.Zed = 1.0
             self.Zn = 1.0
@@ -405,7 +420,7 @@ class OPES:
                 self.force.updateParametersInContext(context)
             return
 
-        # Build kernel sum expression: Σ w_k * h_k * G(s,s_k)
+        # Build kernel sum expression: Σ amp_k * G(s,s_k)
         kernel_terms = []
 
         for kernel in self.kernels:
@@ -431,12 +446,11 @@ class OPES:
                 gaussian_terms.append(f"(({diff})^2/{(sigma_j**2):.12g})")
 
             gaussian_expr = "exp(-0.5*(" + "+".join(gaussian_terms) + "))"
-            weight = self._kernel_weight(kernel)
-            height = self._kernel_height(kernel)
+            amp = self._kernel_amplitude(kernel)
 
-            kernel_terms.append(f"({weight:.12g}*{height:.12g}*{gaussian_expr})")
+            kernel_terms.append(f"({amp:.12g}*{gaussian_expr})")
 
-        # P(s) = Σ w_k * h_k * G(s,s_k) / Σ w_k
+        # P(s) = Σ amp_k * G(s,s_k) / sum_weights
         prob_expr = f"({'+'.join(kernel_terms)})/{self.sum_weights:.12g}"
 
         # P(s)/Z_n + ε
@@ -450,114 +464,155 @@ class OPES:
         if context is not None:
             self.force.updateParametersInContext(context)
 
-    def _adaptBandwidth(self):
+    # ------------------------------------------------------------------
+    # Bandwidth adaptation  (Silverman's rule, PLUMED's !fixed_sigma_)
+    # ------------------------------------------------------------------
+
+    def _adaptBandwidth(self, neff=None):
         """
         Adapt bandwidth using Silverman's rule.
 
         σ_i^(n) = σ_i^(0) * [N_eff * (d+2)/4]^(-1/(d+4))
-        """
 
-        if not self.adaptive_sigma or len(self.kernels) < 2:
+        Uses PLUMED's robust neff formula: (1 + Σw)² / (1 + Σw²).
+        """
+        if not self.adaptive_sigma:
             return
 
-        # Effective sample size
-        N_eff = self.sum_weights**2 / self.sum_weights_sq if self.sum_weights_sq > 0 else 1.0
+        if neff is None:
+            neff = (1.0 + self.sum_weights) ** 2 / (1.0 + self.sum_weights_sq)
 
-        # Silverman's rule
         d = self.num_cvs
-        factor = (N_eff * (d + 2) / 4.0) ** (-1.0 / (d + 4))
+        factor = (neff * (d + 2) / 4.0) ** (-1.0 / (d + 4))
 
         for i in range(self.num_cvs):
             self.sigma_vals[i] = self.sigma0_vals[i] * factor
 
-    def _compressKernels(self):
-        """Compress kernels that are too close together."""
+    # ------------------------------------------------------------------
+    # PLUMED-style kernel addition with compression
+    # ------------------------------------------------------------------
 
-        if len(self.kernels) < 2:
-            return
+    def _getMergeableKernel(self, center, exclude_idx):
+        """Find the closest existing kernel within the compression threshold.
 
-        compressed = []
+        Uses the *target* kernel's sigma for the distance metric, matching
+        PLUMED's getMergeableKernel().
 
-        for kernel in self.kernels:
-            placed = False
-            for comp_kernel in compressed:
-                # Calculate normalized distance
-                dist2 = 0.0
-                for j in range(self.num_cvs):
-                    diff = self._periodic_difference(kernel[j], comp_kernel[j], j)
-                    sigma_j = self._kernel_sigma(comp_kernel)[j]
-                    dist2 += (diff / sigma_j) ** 2
-                dist = math.sqrt(dist2)
+        Returns (index, norm2) or (None, threshold2) if no match.
+        """
+        min_k = None
+        min_norm2 = self.compression_threshold2
 
-                if dist < self.compression_threshold:
-                    # Merge full kernel state (center, sigma, weight, height)
-                    w1 = self._kernel_weight(comp_kernel)
-                    w2 = self._kernel_weight(kernel)
-                    h1 = self._kernel_height(comp_kernel)
-                    h2 = self._kernel_height(kernel)
-                    tot_w = w1 + w2
-
-                    for j in range(self.num_cvs):
-                        c1 = float(comp_kernel[j])
-                        c2 = float(kernel[j])
-                        periodic = self.periodic[j]
-                        if periodic is not None:
-                            periodic = self._periodic_range(j)
-                            c1 = c2 + self._periodic_difference(c1, c2, j)
-                        merged_c = (w1 * c1 + w2 * c2) / tot_w
-                        if periodic is not None:
-                            pmin = periodic[0]
-                            pmax = periodic[1]
-                            period = pmax - pmin
-                            merged_c = pmin + ((merged_c - pmin) % period)
-                        comp_kernel[j] = merged_c
-
-                    sigma1 = self._kernel_sigma(comp_kernel)
-                    sigma2 = self._kernel_sigma(kernel)
-                    merged_sigma = []
-                    for j in range(self.num_cvs):
-                        s1 = sigma1[j]
-                        s2 = sigma2[j]
-                        c1 = float(comp_kernel[j])
-                        c2 = float(kernel[j])
-                        ss = (w1 * (s1 * s1 + c1 * c1) + w2 * (s2 * s2 + c2 * c2)) / tot_w - ((w1 * c1 + w2 * c2) / tot_w) ** 2
-                        merged_sigma.append(max(1e-8, math.sqrt(max(ss, 1e-16))))
-
-                    if len(comp_kernel) >= 2 * self.num_cvs + 2:
-                        for j in range(self.num_cvs):
-                            comp_kernel[self.num_cvs + j] = merged_sigma[j]
-                        comp_kernel[2 * self.num_cvs] = tot_w
-                        comp_kernel[2 * self.num_cvs + 1] = (w1 * h1 + w2 * h2) / tot_w
-                    else:
-                        # Backward-compatible fallback: old kernel rows only store weight/height.
-                        comp_kernel[self.num_cvs] += kernel[self.num_cvs]
-                    placed = True
+        for k, existing in enumerate(self.kernels):
+            if k == exclude_idx:
+                continue
+            center_k = self._kernel_center(existing)
+            sigma_k = self._kernel_sigma(existing)
+            norm2 = 0.0
+            skip = False
+            for j in range(self.num_cvs):
+                diff = self._periodic_difference(center[j], center_k[j], j)
+                norm2 += (diff / sigma_k[j]) ** 2
+                if norm2 >= min_norm2:
+                    skip = True
                     break
+            if not skip and norm2 < min_norm2:
+                min_norm2 = norm2
+                min_k = k
 
-            if not placed:
-                compressed.append(list(kernel))
+        return min_k, min_norm2
 
-        old_count = len(self.kernels)
-        self.kernels = compressed
-        new_count = len(self.kernels)
+    def _mergeKernels(self, target, source):
+        """Merge *source* kernel into *target* kernel in-place.
 
-        if new_count < old_count:
-            print(f"OPES: Compressed {old_count} kernels to {new_count}")
+        Matches PLUMED's ``mergeKernels``: heights add, centres and sigmas
+        are height-weighted averages preserving the second moment.
+        """
+        h1 = self._kernel_amplitude(target)
+        h2 = self._kernel_amplitude(source)
+        h_total = h1 + h2
 
-        # Recalculate statistics after compression/merging.
-        self.sum_weights = sum(self._kernel_weight(k) for k in self.kernels)
-        self.sum_weights_sq = sum(self._kernel_weight(k) ** 2 for k in self.kernels)
+        c1 = self._kernel_center(target)
+        c2 = self._kernel_center(source)
+        s1 = self._kernel_sigma(target)
+        s2 = self._kernel_sigma(source)
+
+        for j in range(self.num_cvs):
+            is_periodic = self.periodic[j] is not None
+            if is_periodic:
+                # Fix PBC: bring c1 close to c2
+                c1[j] = c2[j] + self._periodic_difference(c1[j], c2[j], j)
+
+            c_merged = (h1 * c1[j] + h2 * c2[j]) / h_total
+            ss = (h1 * (s1[j] ** 2 + c1[j] ** 2) +
+                  h2 * (s2[j] ** 2 + c2[j] ** 2)) / h_total - c_merged ** 2
+
+            if is_periodic:
+                pmin, pmax = self.periodic[j]
+                period = pmax - pmin
+                c_merged = pmin + ((c_merged - pmin) % period)
+
+            target[j] = c_merged
+            target[self.num_cvs + j] = math.sqrt(max(ss, 1e-16))
+
+        # Store merged amplitude in the weight slot; height stays 1.0.
+        target[2 * self.num_cvs] = h_total
+        target[2 * self.num_cvs + 1] = 1.0
+
+    def _addKernel(self, kernel):
+        """Add a kernel, attempting PLUMED-style merge + recursive merge."""
+        if self.compression_threshold2 > 0 and len(self.kernels) > 0:
+            center_new = self._kernel_center(kernel)
+            taker_k, norm2 = self._getMergeableKernel(center_new, exclude_idx=-1)
+
+            if taker_k is not None:
+                # Merge new kernel into the closest existing one
+                self._mergeKernels(self.kernels[taker_k], kernel)
+
+                # Recursive merge: the merged kernel might now overlap another
+                giver_k = taker_k
+                while True:
+                    center_g = self._kernel_center(self.kernels[giver_k])
+                    taker_k2, norm2_2 = self._getMergeableKernel(center_g, exclude_idx=giver_k)
+                    if taker_k2 is None:
+                        break
+                    # Keep the lower index to avoid shifting issues on pop
+                    if taker_k2 > giver_k:
+                        taker_k2, giver_k = giver_k, taker_k2
+                    self._mergeKernels(self.kernels[taker_k2], self.kernels[giver_k])
+                    self.kernels.pop(giver_k)
+                    giver_k = taker_k2
+                return
+
+        # No merge — append as a new kernel
+        self.kernels.append(list(kernel))
 
     def _evaluateProbability(self, cv_values):
         """
         Evaluate probability estimate at given CV values.
-        P(s) = Σ w_k * h_k * G(s, s_k) / Σ w_k
+        P(s) = Σ amp_k * G(s, s_k) / sum_weights
         """
 
         return self._evaluate_probability_kernel_set(cv_values)
 
+    # ------------------------------------------------------------------
+    # Main simulation driver
+    # ------------------------------------------------------------------
+
     def step(self, simulation, steps):
-        """Advance the simulation while depositing OPES kernels."""
+        """Advance the simulation while depositing OPES kernels.
+
+        Follows the PLUMED OPESmetad update() flow:
+          1. Compute log_weight = V(s)/kT from the current bias.
+          2. raw_weight = exp(log_weight) ; accumulate into sum_weights
+             **before** any sigma rescaling.
+          3. Compute neff with PLUMED's robust formula (1+Σw)²/(1+Σw²).
+          4. Adapt bandwidth (Silverman rule) using neff.
+          5. Rescale height: kernel_height = raw_weight × Π(σ0/σ).
+          6. Add kernel (with compression / recursive merge).
+          7. Update Zed normalisation.
+          8. Update the bias force expression / table.
+        """
 
         steps_remaining = int(steps)
 
@@ -573,39 +628,56 @@ class OPES:
 
             # Deposit kernel at stride
             if (self.step_count % self.stride) == 0:
+                # PLUMED skips the very first update (useful for restarts).
+                if self._is_first_step:
+                    self._is_first_step = False
+                    continue
+
                 # Get current CV values
                 cv_values = self.force.getCollectiveVariableValues(simulation.context)
                 cv_values = [float(x) for x in cv_values]
 
-                # Calculate weight: w_k = exp(β * V_{k-1}(s_k))
+                # ---- 1. log_weight from the current bias ----
                 current_bias = self._evaluateBias(cv_values)
-                # In the PLUMED reference, the deposited kernel amplitude is
-                # carried by the kernel height; here we store that amplitude in
-                # the weight slot and keep height as a neutral factor so we do
-                # not double-count the kernel contribution during evaluation.
-                weight = self._compute_kernel_height(self.beta * current_bias, self.sigma_vals)
-                height = 1.0
+                log_weight = self.beta * current_bias
+                raw_weight = math.exp(log_weight)
 
-                # Deposit kernel: [cv0, cv1, ..., sigma0, sigma1, ..., weight, height]
-                kernel = self._kernel_row(cv_values, self.sigma_vals, weight, height)
-                self.kernels.append(kernel)
+                # ---- 2. Accumulate sum_weights BEFORE sigma rescaling ----
+                self._counter += 1
+                self.sum_weights += raw_weight
+                self.sum_weights_sq += raw_weight ** 2
+
+                # ---- 3. neff (PLUMED's robust formula) ----
+                neff = (1.0 + self.sum_weights) ** 2 / (1.0 + self.sum_weights_sq)
+
                 self.kernel_counter += 1
 
-                # Update statistics
-                self.sum_weights += weight
-                self.sum_weights_sq += weight ** 2
+                # ---- 4. Adapt bandwidth every step ----
+                self._adaptBandwidth(neff)
 
-                # Compress kernels periodically BEFORE updating bias
-                if self.kernel_counter % 100 == 0:
-                    self._adaptBandwidth()
-                    self._compressKernels()
+                # ---- 5. Sigma-rescaled kernel height ----
+                kernel_height = raw_weight
+                for s0, s in zip(self.sigma0_vals, self.sigma_vals):
+                    if s <= 0:
+                        raise ValueError("sigma values must stay positive")
+                    kernel_height *= s0 / s
 
-                # Recompute the normalization on the final kernel list.
+                # ---- 6. Add kernel (with PLUMED-style compression) ----
+                kernel = self._kernel_row(cv_values, self.sigma_vals,
+                                          kernel_height, 1.0)
+                old_nker = len(self.kernels)
+                self._addKernel(kernel)
+                new_nker = len(self.kernels)
+                if new_nker < old_nker:
+                    print(f"OPES: Compressed {old_nker + 1} → {new_nker} kernels")
+
+                # ---- 7. Update Zed ----
                 self._updateZn()
 
-                # Rebuild the tabulated bias only periodically; the
-                # deposition math still uses the current kernel set every time.
-                if (not self.use_tabulated_bias) or (self.kernel_counter % self.bias_update_stride == 0) or self.kernel_counter == 1:
+                # ---- 8. Rebuild bias expression / table ----
+                if ((not self.use_tabulated_bias)
+                        or (self.kernel_counter % self.bias_update_stride == 0)
+                        or self.kernel_counter == 1):
                     self._updateBiasExpression(simulation.context)
 
                 # Save periodically
@@ -658,7 +730,7 @@ class OPES:
             barrier=np.array(self.barrier),
             bias_factor=np.array(self.bias_factor),
             kernel_cutoff=np.array(self.kernel_cutoff),
-            format_version=np.array(2),
+            format_version=np.array(3),
         )
 
     def loadKernels(self, filename):
@@ -670,6 +742,11 @@ class OPES:
             arr = data['kernels']
             for row in arr:
                 self.kernels.append([float(x) for x in row])
+            # Restore running sums if available
+            if 'sum_weights' in data:
+                self.sum_weights = float(data['sum_weights'])
+            if 'sum_weights_sq' in data:
+                self.sum_weights_sq = float(data['sum_weights_sq'])
         else:
             with open(filename, 'r') as f:
                 for line in f:
@@ -679,9 +756,8 @@ class OPES:
                     if len(values) in (self.num_cvs + 2, 2 * self.num_cvs + 2):
                         self.kernels.append(values)
 
-        # Recalculate statistics
-        self.sum_weights = sum(self._kernel_weight(k) for k in self.kernels)
-        self.sum_weights_sq = sum(self._kernel_weight(k)**2 for k in self.kernels)
+        # Only rebuild Zed and bias (sum_weights is restored from file or
+        # must be left as-is — never recalculated from kernel amplitudes).
         self._updateZn()
         self._updateBiasExpression()
 
