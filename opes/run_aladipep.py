@@ -40,7 +40,7 @@ opes_bias = opes.OPES(
     barrier=40 * unit.kilojoules_per_mole,
     sigma=[0.35 * unit.radian, 0.35 * unit.radian],
     stride=kernel_pace,
-    saveFrequency=stride,
+    saveFrequency=50000,  # every 100 depositions (100 ps); was stride=500 → every deposition!
     biasDir='output',
     periodic=[(-np.pi, np.pi), (-np.pi, np.pi)],  # Both phi and psi are periodic!
 )

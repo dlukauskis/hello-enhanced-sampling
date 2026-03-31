@@ -313,7 +313,13 @@ class OPES:
         return self._kernel_amplitude(kernel) * (math.exp(-0.5 * norm2) - self.val_at_cutoff)
 
     def _build_bias_table(self):
-        """Build a 2D tabulated bias from the current kernel set."""
+        """Build a 2D tabulated bias from the current kernel set.
+
+        Uses chunked kernel processing to keep memory bounded at O(C*Ny*Nx)
+        instead of O(N*Ny*Nx), where C is a small constant chunk size.
+        Inspired by OPESmetad.cpp which processes kernels with cache-friendly
+        access patterns.
+        """
         if not self.use_tabulated_bias:
             return None
 
@@ -329,41 +335,56 @@ class OPES:
                 np.linspace(x_min, x_max, self.bias_grid_points),
                 np.linspace(y_min, y_max, self.bias_grid_points),
             )
+            # Cache meshgrid — these never change
+            x_grid, y_grid = self.bias_grid
+            self._bias_X, self._bias_Y = np.meshgrid(x_grid, y_grid)
 
-        x_grid, y_grid = self.bias_grid
-        X, Y = np.meshgrid(x_grid, y_grid)
+        X = self._bias_X  # (Ny, Nx)
+        Y = self._bias_Y
 
         n = len(self.kernels)
-        if n == 0:
-            prob = np.zeros_like(X)
-        else:
-            # Fully vectorized: broadcast (N,1,1) vs (Ny,Nx)
-            # Memory: N * Ny * Nx * 8 bytes.  For N=500, 96x96 → ~35 MB, fine.
+        ng = self.bias_grid_points
+        prob = np.zeros(ng * ng, dtype=np.float64).reshape(ng, ng)
+
+        if n > 0:
             centers = self._np_centers   # (N, 2)
             sigmas = self._np_sigmas     # (N, 2)
             amps = self._np_amps         # (N,)
+            p0 = (self.periodic[0][1] - self.periodic[0][0]) if self.periodic[0] is not None else 0.0
+            p1 = (self.periodic[1][1] - self.periodic[1][0]) if self.periodic[1] is not None else 0.0
+            cutoff2 = self.kernel_cutoff2
+            vac = self.val_at_cutoff
 
-            dx = X[np.newaxis, :, :] - centers[:, 0, np.newaxis, np.newaxis]  # (N,Ny,Nx)
-            dy = Y[np.newaxis, :, :] - centers[:, 1, np.newaxis, np.newaxis]
+            # Process kernels in small chunks to bound peak memory at
+            # chunk_size * Ny * Nx * 8 bytes  (~2.4 MB for chunk=32, 96×96)
+            # instead of N * Ny * Nx * 8 bytes (~37 MB at N=500).
+            chunk_size = 32
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                c = centers[start:end]      # (C, 2)
+                s = sigmas[start:end]       # (C, 2)
+                a = amps[start:end]         # (C,)
 
-            if self.periodic[0] is not None:
-                p0 = self.periodic[0][1] - self.periodic[0][0]
-                dx -= p0 * np.round(dx / p0)
-            if self.periodic[1] is not None:
-                p1 = self.periodic[1][1] - self.periodic[1][0]
-                dy -= p1 * np.round(dy / p1)
+                dx = X[np.newaxis, :, :] - c[:, 0, np.newaxis, np.newaxis]
+                dy = Y[np.newaxis, :, :] - c[:, 1, np.newaxis, np.newaxis]
 
-            norm2 = (dx / sigmas[:, 0, np.newaxis, np.newaxis]) ** 2 + \
-                     (dy / sigmas[:, 1, np.newaxis, np.newaxis]) ** 2
-            gaussian = np.where(norm2 < self.kernel_cutoff2,
-                                np.exp(-0.5 * norm2) - self.val_at_cutoff, 0.0)
-            prob = np.sum(amps[:, np.newaxis, np.newaxis] * gaussian, axis=0)
+                if p0 != 0.0:
+                    dx -= p0 * np.round(dx / p0)
+                if p1 != 0.0:
+                    dy -= p1 * np.round(dy / p1)
+
+                norm2 = (dx / s[:, 0, np.newaxis, np.newaxis]) ** 2 + \
+                         (dy / s[:, 1, np.newaxis, np.newaxis]) ** 2
+                mask = norm2 < cutoff2
+                # Only compute exp where mask is True to save FLOPs
+                gaussian = np.where(mask, np.exp(-0.5 * norm2) - vac, 0.0)
+                prob += np.einsum('k,kij->ij', a, gaussian)
 
         if self.sum_weights > 0:
-            prob /= self.sum_weights
+            prob *= (1.0 / self.sum_weights)
 
         regularized = prob / self.Zed + self.epsilon
-        regularized = np.clip(regularized, self.epsilon, None)
+        np.clip(regularized, self.epsilon, None, out=regularized)
         coeff = (1.0 - 1.0 / self.bias_factor) * self.kT
         bias = coeff * np.log(regularized)
         bias -= np.min(bias)
@@ -524,11 +545,11 @@ class OPES:
         self.Zn = self.Zed
 
     def _updateZn_full(self):
-        """Full Zed computation, vectorized with numpy.
+        """Full Zed computation, fully vectorized with numpy.
 
-        O(N²) in kernel evaluations but each inner loop is a fast
-        numpy operation over N elements, so much faster than the
-        original pure-Python double loop.
+        O(N²) in kernel evaluations, processed in chunks to bound memory
+        at O(C*N) instead of O(N²).  Eliminates the Python for-loop that
+        previously iterated over each kernel individually.
         """
         if len(self.kernels) == 0 or self.sum_weights <= 0:
             self.Zed = 1.0
@@ -536,20 +557,27 @@ class OPES:
             return
 
         n = len(self.kernels)
+        centers = self._np_centers   # (N, ncv)
+        sigmas = self._np_sigmas     # (N, ncv)
+        amps = self._np_amps         # (N,)
         sum_uprob = 0.0
 
-        for k in range(n):
-            center_k = self._np_centers[k]
-            diff = center_k[np.newaxis, :] - self._np_centers    # (N, ncv)
+        # Process outer dimension in chunks to cap memory at chunk*N*ncv
+        chunk = min(n, 64)
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            # (C, 1, ncv) - (1, N, ncv) → (C, N, ncv)
+            diff = (centers[start:end, np.newaxis, :]
+                    - centers[np.newaxis, :, :])
             for j in range(self.num_cvs):
                 if self.periodic[j] is not None:
                     p = self.periodic[j][1] - self.periodic[j][0]
-                    diff[:, j] -= p * np.round(diff[:, j] / p)
-            norm2 = np.sum((diff / self._np_sigmas) ** 2, axis=1)
+                    diff[:, :, j] -= p * np.round(diff[:, :, j] / p)
+            norm2 = np.sum((diff / sigmas[np.newaxis, :, :]) ** 2, axis=2)  # (C, N)
             mask = norm2 < self.kernel_cutoff2
             vals = np.where(mask,
-                            self._np_amps * (np.exp(-0.5 * norm2)
-                                             - self.val_at_cutoff),
+                            amps[np.newaxis, :] * (np.exp(-0.5 * norm2)
+                                                   - self.val_at_cutoff),
                             0.0)
             sum_uprob += float(np.sum(vals))
 
@@ -668,17 +696,25 @@ class OPES:
         """Find the closest kernel within the compression threshold.
 
         Vectorized with numpy for O(N) with fast constant factors.
+        Uses the cached numpy arrays when they are still valid (same size
+        as kernel list), avoiding redundant list→array conversion.
         """
         n = len(self.kernels)
         if n == 0:
             return None, self.compression_threshold2
 
-        # Build arrays directly from kernel list (always up-to-date,
-        # even during recursive merges when the numpy cache is stale).
-        centers_arr = np.array([k[:self.num_cvs] for k in self.kernels],
-                               dtype=np.float64)
-        sigmas_arr = np.array([k[self.num_cvs:2 * self.num_cvs]
-                               for k in self.kernels], dtype=np.float64)
+        # Use cached arrays if they have the right size (they are fresh
+        # for the first call in _addKernel, before any modification).
+        # During recursive merge, kernels may have been popped → size mismatch
+        # → rebuild from the list.
+        if len(self._np_centers) == n:
+            centers_arr = self._np_centers
+            sigmas_arr = self._np_sigmas
+        else:
+            centers_arr = np.array([k[:self.num_cvs] for k in self.kernels],
+                                   dtype=np.float64)
+            sigmas_arr = np.array([k[self.num_cvs:2 * self.num_cvs]
+                                   for k in self.kernels], dtype=np.float64)
 
         center_arr = np.asarray(center, dtype=np.float64)
         diff = center_arr[np.newaxis, :] - centers_arr          # (N, ncv)

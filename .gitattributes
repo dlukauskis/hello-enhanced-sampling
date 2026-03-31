@@ -2,3 +2,5 @@ benchmark_systems/aladipep/* filter=lfs diff=lfs merge=lfs -text
 benchmark_systems/bCD-G1/* filter=lfs diff=lfs merge=lfs -text
 wt-metadynamics/metadynamics.py filter=lfs diff=lfs merge=lfs -text
 wt-metadynamics/metadynamicsreporter.py filter=lfs diff=lfs merge=lfs -text
+wt-metadynamics/aladipep-results.png filter=lfs diff=lfs merge=lfs -text
+opes/opes-aladipep-results.png filter=lfs diff=lfs merge=lfs -text
