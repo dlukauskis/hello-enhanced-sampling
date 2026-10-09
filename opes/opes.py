@@ -119,6 +119,12 @@ class OPES:
         self.bias_update_stride = 1
         self.bias_function = None
         self.bias_grid = None
+        # Cache the unnormalized KDE grid, so changed kernels can update it
+        # without reevaluating every unchanged kernel after each deposition.
+        self._bias_probability_sum = None
+        self._bias_probability_revision = -1
+        self._bias_probability_updates = 0
+        self._bias_probability_error = 0.0
 
         # Initial bandwidth (sigma)
         if sigma is None:
@@ -147,6 +153,7 @@ class OPES:
         # rescaling); height is kept at 1.0 so that amplitude = weight * height.
         self.kernels = []
         self.kernel_counter = 0
+        self._kernel_revision = 0
 
         # Z_n / Zed: normalization over explored CV space
         self.Zed = 1.0
@@ -312,13 +319,38 @@ class OPES:
                 return 0.0
         return self._kernel_amplitude(kernel) * (math.exp(-0.5 * norm2) - self.val_at_cutoff)
 
-    def _build_bias_table(self):
-        """Build a 2D tabulated bias from the current kernel set.
+    def _accumulate_probability_grid(self, prob, centers, sigmas, amps):
+        """Add signed kernel contributions to the unnormalized KDE grid.
 
-        Uses chunked kernel processing to keep memory bounded at O(C*Ny*Nx)
-        instead of O(N*Ny*Nx), where C is a small constant chunk size.
-        Inspired by OPESmetad.cpp which processes kernels with cache-friendly
-        access patterns.
+        Compute periodic distances along each axis before broadcasting to the
+        2D grid. The radial cutoff and subtraction match _evaluateKernel.
+        """
+        x_grid, y_grid = self.bias_grid
+        periods = [bounds[1] - bounds[0] for bounds in self.periodic]
+        for start in range(0, len(amps), 32):
+            end = start + 32
+            c = centers[start:end]
+            s = sigmas[start:end]
+            dx = x_grid[np.newaxis, :] - c[:, 0, np.newaxis]
+            dy = y_grid[np.newaxis, :] - c[:, 1, np.newaxis]
+            dx -= periods[0] * np.round(dx / periods[0])
+            dy -= periods[1] * np.round(dy / periods[1])
+            norm_x = (dx / s[:, 0, np.newaxis]) ** 2
+            norm_y = (dy / s[:, 1, np.newaxis]) ** 2
+            norm2 = norm_x[:, np.newaxis, :] + norm_y[:, :, np.newaxis]
+            gaussian = np.exp(-0.5 * norm2)
+            gaussian -= self.val_at_cutoff
+            gaussian[norm2 >= self.kernel_cutoff2] = 0.0
+            prob += np.einsum('k,kij->ij', amps[start:end], gaussian)
+
+    def _build_bias_table(self, incremental=False):
+        """Build the periodic 2D bias, optionally applying the latest deltas.
+
+        A delta update is valid only when the cached grid predates exactly one
+        kernel addition. Rebuild after skipped updates, loads, or 128 delta
+        updates to bound roundoff. Very small regularization floors also force
+        a rebuild when estimated subtraction error could affect the bias.
+        Direct callers get a full rebuild by default.
         """
         if not self.use_tabulated_bias:
             return None
@@ -335,50 +367,49 @@ class OPES:
                 np.linspace(x_min, x_max, self.bias_grid_points),
                 np.linspace(y_min, y_max, self.bias_grid_points),
             )
-            # Cache meshgrid — these never change
-            x_grid, y_grid = self.bias_grid
-            self._bias_X, self._bias_Y = np.meshgrid(x_grid, y_grid)
-
-        X = self._bias_X  # (Ny, Nx)
-        Y = self._bias_Y
-
         n = len(self.kernels)
-        ng = self.bias_grid_points
-        prob = np.zeros(ng * ng, dtype=np.float64).reshape(ng, ng)
-
-        if n > 0:
-            centers = self._np_centers   # (N, 2)
-            sigmas = self._np_sigmas     # (N, 2)
-            amps = self._np_amps         # (N,)
-            p0 = (self.periodic[0][1] - self.periodic[0][0]) if self.periodic[0] is not None else 0.0
-            p1 = (self.periodic[1][1] - self.periodic[1][0]) if self.periodic[1] is not None else 0.0
-            cutoff2 = self.kernel_cutoff2
-            vac = self.val_at_cutoff
-
-            # Process kernels in small chunks to bound peak memory at
-            # chunk_size * Ny * Nx * 8 bytes  (~2.4 MB for chunk=32, 96×96)
-            # instead of N * Ny * Nx * 8 bytes (~37 MB at N=500).
-            chunk_size = 32
-            for start in range(0, n, chunk_size):
-                end = min(start + chunk_size, n)
-                c = centers[start:end]      # (C, 2)
-                s = sigmas[start:end]       # (C, 2)
-                a = amps[start:end]         # (C,)
-
-                dx = X[np.newaxis, :, :] - c[:, 0, np.newaxis, np.newaxis]
-                dy = Y[np.newaxis, :, :] - c[:, 1, np.newaxis, np.newaxis]
-
-                if p0 != 0.0:
-                    dx -= p0 * np.round(dx / p0)
-                if p1 != 0.0:
-                    dy -= p1 * np.round(dy / p1)
-
-                norm2 = (dx / s[:, 0, np.newaxis, np.newaxis]) ** 2 + \
-                         (dy / s[:, 1, np.newaxis, np.newaxis]) ** 2
-                mask = norm2 < cutoff2
-                # Only compute exp where mask is True to save FLOPs
-                gaussian = np.where(mask, np.exp(-0.5 * norm2) - vac, 0.0)
-                prob += np.einsum('k,kij->ij', a, gaussian)
+        use_delta = (incremental
+                     and self._bias_probability_sum is not None
+                     and self._bias_probability_revision == self._kernel_revision - 1
+                     and self._bias_probability_updates < 128
+                     and 0 < len(self._delta_kernels) < n)
+        if use_delta:
+            # Near zero density the logarithm can amplify cancellation error.
+            # Budget roundoff against the regularization floor in raw KDE units
+            # rather than assuming every BARRIER and bandwidth is safe to cache.
+            amps = np.asarray([d[0] for d in self._delta_kernels], dtype=np.float64)
+            error = self._bias_probability_error + 8 * np.finfo(np.float64).eps * (
+                np.max(self._bias_probability_sum) + np.sum(np.abs(amps))
+            )
+            raw_floor = self.epsilon * self.sum_weights * self.Zed
+            use_delta = error <= 1e-5 * raw_floor
+        if use_delta:
+            delta = self._delta_kernels
+            self._accumulate_probability_grid(
+                self._bias_probability_sum,
+                np.asarray([d[1] for d in delta], dtype=np.float64),
+                np.asarray([d[2] for d in delta], dtype=np.float64),
+                amps,
+            )
+            # Exact KDE sums are nonnegative. Remove tiny negative residues
+            # left by subtracting removed kernels before taking the logarithm.
+            np.maximum(self._bias_probability_sum, 0.0,
+                       out=self._bias_probability_sum)
+            self._bias_probability_updates += 1
+            self._bias_probability_error = error
+        else:
+            self._bias_probability_sum = np.zeros(
+                (self.bias_grid_points, self.bias_grid_points), dtype=np.float64
+            )
+            if n > 0:
+                self._accumulate_probability_grid(
+                    self._bias_probability_sum,
+                    self._np_centers, self._np_sigmas, self._np_amps,
+                )
+            self._bias_probability_updates = 0
+            self._bias_probability_error = 0.0
+        self._bias_probability_revision = self._kernel_revision
+        prob = self._bias_probability_sum.copy()
 
         if self.sum_weights > 0:
             prob *= (1.0 / self.sum_weights)
@@ -584,7 +615,7 @@ class OPES:
         self.Zed = sum_uprob / self.sum_weights / n
         self.Zn = self.Zed
 
-    def _updateBiasExpression(self, context=None):
+    def _updateBiasExpression(self, context=None, incremental=False):
         """
         Update the bias energy expression.
 
@@ -594,7 +625,7 @@ class OPES:
         if self.use_tabulated_bias:
             if self.bias_function is None:
                 return
-            values = self._build_bias_table()
+            values = self._build_bias_table(incremental=incremental)
             if values is None:
                 return
             periodic0 = self._periodic_range(0)
@@ -696,17 +727,14 @@ class OPES:
         """Find the closest kernel within the compression threshold.
 
         Vectorized with numpy for O(N) with fast constant factors.
-        Uses the cached numpy arrays when they are still valid (same size
-        as kernel list), avoiding redundant list→array conversion.
+        Reuses cached arrays while the kernel count matches. The only changed
+        kernel before the first recursive lookup is exclude_idx, whose entry
+        is ignored. After a removal, rebuild from the remaining kernels.
         """
         n = len(self.kernels)
         if n == 0:
             return None, self.compression_threshold2
 
-        # Use cached arrays if they have the right size (they are fresh
-        # for the first call in _addKernel, before any modification).
-        # During recursive merge, kernels may have been popped → size mismatch
-        # → rebuild from the list.
         if len(self._np_centers) == n:
             centers_arr = self._np_centers
             sigmas_arr = self._np_sigmas
@@ -776,6 +804,7 @@ class OPES:
 
         Also populates self._delta_kernels for the incremental Zed update.
         """
+        self._kernel_revision += 1
         if self.compression_threshold2 > 0 and len(self.kernels) > 0:
             center_new = self._kernel_center(kernel)
             taker_k, norm2 = self._getMergeableKernel(center_new, exclude_idx=-1)
@@ -943,7 +972,7 @@ class OPES:
                 if ((not self.use_tabulated_bias)
                         or (self.kernel_counter % self.bias_update_stride == 0)
                         or self.kernel_counter == 1):
-                    self._updateBiasExpression(simulation.context)
+                    self._updateBiasExpression(simulation.context, incremental=True)
 
                 # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
@@ -1001,6 +1030,7 @@ class OPES:
     def loadKernels(self, filename):
         """Load kernels from file."""
 
+        self._kernel_revision += 1
         self.kernels = []
         if filename.endswith('.npz'):
             data = np.load(filename)
