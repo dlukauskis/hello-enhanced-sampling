@@ -119,6 +119,12 @@ class OPES:
         self.bias_update_stride = 1
         self.bias_function = None
         self.bias_grid = None
+        # Cache the unnormalized KDE grid, so changed kernels can update it
+        # without reevaluating every unchanged kernel after each deposition.
+        self._bias_probability_sum = None
+        self._bias_probability_revision = -1
+        self._bias_probability_updates = 0
+        self._bias_probability_error = 0.0
 
         # Initial bandwidth (sigma)
         if sigma is None:
@@ -147,6 +153,7 @@ class OPES:
         # rescaling); height is kept at 1.0 so that amplitude = weight * height.
         self.kernels = []
         self.kernel_counter = 0
+        self._kernel_revision = 0
 
         # Z_n / Zed: normalization over explored CV space
         self.Zed = 1.0
@@ -165,6 +172,22 @@ class OPES:
         self._is_first_step = True
         # Counter of actual deposition calls (including the skipped first one)
         self._counter = 0
+
+        # --- Performance: delta-kernel tracking for incremental Zed update ---
+        # Inspired by OPESmetad.cpp's delta_kernels_ mechanism which avoids
+        # the O(N²) full Zed recomputation on every step.
+        self._delta_kernels = []   # list of (height, center_list, sigma_list)
+        self._old_KDEnorm = 0.0
+        self._old_nker = 0
+
+        # --- Performance: numpy array cache for vectorized operations ---
+        self._np_centers = np.empty((0, self.num_cvs))
+        self._np_sigmas = np.empty((0, self.num_cvs))
+        self._np_amps = np.empty(0)
+
+    # ------------------------------------------------------------------
+    # Periodic helpers
+    # ------------------------------------------------------------------
 
     def _periodic_difference(self, value, center, cv_index):
         """Calculate periodic difference for a CV."""
@@ -185,6 +208,10 @@ class OPES:
         if periodic is None:
             raise ValueError("Requested periodic range for a non-periodic CV")
         return periodic
+
+    # ------------------------------------------------------------------
+    # Kernel accessors
+    # ------------------------------------------------------------------
 
     def _kernel_sigma(self, kernel):
         """Return the per-kernel sigma vector from a stored kernel row."""
@@ -216,21 +243,55 @@ class OPES:
         return self._kernel_weight(kernel) * self._kernel_height(kernel)
 
     # ------------------------------------------------------------------
-    # Kernel evaluation
+    # Numpy cache for vectorized operations
+    # ------------------------------------------------------------------
+
+    def _build_numpy_cache(self):
+        """Rebuild numpy arrays from the kernel list.
+
+        This is O(N) and called once per deposition step — negligible
+        compared to the kernel evaluations it accelerates.
+        """
+        n = len(self.kernels)
+        if n == 0:
+            self._np_centers = np.empty((0, self.num_cvs))
+            self._np_sigmas = np.empty((0, self.num_cvs))
+            self._np_amps = np.empty(0)
+            return
+        arr = np.array(self.kernels, dtype=np.float64)
+        self._np_centers = arr[:, :self.num_cvs]
+        self._np_sigmas = arr[:, self.num_cvs:2 * self.num_cvs]
+        self._np_amps = arr[:, 2 * self.num_cvs] * arr[:, 2 * self.num_cvs + 1]
+
+    # ------------------------------------------------------------------
+    # Kernel evaluation (vectorized)
     # ------------------------------------------------------------------
 
     def _evaluate_probability_kernel_set(self, cv_values, kernels=None):
-        """Evaluate the KDE probability using the stored kernel set.
+        """Evaluate the KDE probability using vectorized numpy operations.
 
-        Returns  sum(amplitude_k * G_k(s)) / sum_weights
-        where sum_weights tracks the raw reweighting factors (PLUMED's
-        KDEnorm = sum_weights_).
+        Returns  sum(amplitude_k * G_k(s)) / sum_weights.
         """
-        if kernels is None:
-            kernels = self.kernels
-        if len(kernels) == 0:
+        if kernels is not None:
+            return self._evaluate_probability_kernel_set_list(cv_values, kernels)
+        if len(self.kernels) == 0 or self.sum_weights <= 0:
             return 0.0
 
+        cv = np.asarray(cv_values, dtype=np.float64)
+        diff = cv[np.newaxis, :] - self._np_centers          # (N, ncv)
+        for j in range(self.num_cvs):
+            if self.periodic[j] is not None:
+                period = self.periodic[j][1] - self.periodic[j][0]
+                diff[:, j] -= period * np.round(diff[:, j] / period)
+        norm2 = np.sum((diff / self._np_sigmas) ** 2, axis=1)  # (N,)
+        mask = norm2 < self.kernel_cutoff2
+        gaussian = np.where(mask, np.exp(-0.5 * norm2) - self.val_at_cutoff, 0.0)
+        return float(np.sum(self._np_amps * gaussian)) / self.sum_weights
+
+    def _evaluate_probability_kernel_set_list(self, cv_values, kernels):
+        """Fallback list-based probability evaluation for custom kernel sets."""
+        if len(kernels) == 0:
+            return 0.0
         weighted_sum = 0.0
         for kernel in kernels:
             centers = self._kernel_center(kernel)
@@ -239,14 +300,11 @@ class OPES:
             for j in range(self.num_cvs):
                 diff = self._periodic_difference(cv_values[j], centers[j], j)
                 norm2 += (diff / sigma_vals[j]) ** 2
-
             if norm2 >= self.kernel_cutoff2:
                 gaussian = 0.0
             else:
                 gaussian = math.exp(-0.5 * norm2) - self.val_at_cutoff
-
             weighted_sum += self._kernel_amplitude(kernel) * gaussian
-
         return weighted_sum / self.sum_weights if self.sum_weights > 0 else 0.0
 
     def _evaluateKernel(self, kernel, cv_values):
@@ -261,8 +319,39 @@ class OPES:
                 return 0.0
         return self._kernel_amplitude(kernel) * (math.exp(-0.5 * norm2) - self.val_at_cutoff)
 
-    def _build_bias_table(self):
-        """Build a 2D tabulated bias from the current kernel set."""
+    def _accumulate_probability_grid(self, prob, centers, sigmas, amps):
+        """Add signed kernel contributions to the unnormalized KDE grid.
+
+        Compute periodic distances along each axis before broadcasting to the
+        2D grid. The radial cutoff and subtraction match _evaluateKernel.
+        """
+        x_grid, y_grid = self.bias_grid
+        periods = [bounds[1] - bounds[0] for bounds in self.periodic]
+        for start in range(0, len(amps), 32):
+            end = start + 32
+            c = centers[start:end]
+            s = sigmas[start:end]
+            dx = x_grid[np.newaxis, :] - c[:, 0, np.newaxis]
+            dy = y_grid[np.newaxis, :] - c[:, 1, np.newaxis]
+            dx -= periods[0] * np.round(dx / periods[0])
+            dy -= periods[1] * np.round(dy / periods[1])
+            norm_x = (dx / s[:, 0, np.newaxis]) ** 2
+            norm_y = (dy / s[:, 1, np.newaxis]) ** 2
+            norm2 = norm_x[:, np.newaxis, :] + norm_y[:, :, np.newaxis]
+            gaussian = np.exp(-0.5 * norm2)
+            gaussian -= self.val_at_cutoff
+            gaussian[norm2 >= self.kernel_cutoff2] = 0.0
+            prob += np.einsum('k,kij->ij', amps[start:end], gaussian)
+
+    def _build_bias_table(self, incremental=False):
+        """Build the periodic 2D bias, optionally applying the latest deltas.
+
+        A delta update is valid only when the cached grid predates exactly one
+        kernel addition. Rebuild after skipped updates, loads, or 128 delta
+        updates to bound roundoff. Very small regularization floors also force
+        a rebuild when estimated subtraction error could affect the bias.
+        Direct callers get a full rebuild by default.
+        """
         if not self.use_tabulated_bias:
             return None
 
@@ -278,26 +367,55 @@ class OPES:
                 np.linspace(x_min, x_max, self.bias_grid_points),
                 np.linspace(y_min, y_max, self.bias_grid_points),
             )
-
-        x_grid, y_grid = self.bias_grid
-        X, Y = np.meshgrid(x_grid, y_grid)
-        prob = np.zeros_like(X)
-
-        for kernel in self.kernels:
-            centers = self._kernel_center(kernel)
-            sigma_vals = self._kernel_sigma(kernel)
-            amp = self._kernel_amplitude(kernel)
-            dx = self._periodic_difference(X, centers[0], 0)
-            dy = self._periodic_difference(Y, centers[1], 1)
-            norm2 = (dx / sigma_vals[0]) ** 2 + (dy / sigma_vals[1]) ** 2
-            gaussian = np.where(norm2 < self.kernel_cutoff2, np.exp(-0.5 * norm2) - self.val_at_cutoff, 0.0)
-            prob += amp * gaussian
+        n = len(self.kernels)
+        use_delta = (incremental
+                     and self._bias_probability_sum is not None
+                     and self._bias_probability_revision == self._kernel_revision - 1
+                     and self._bias_probability_updates < 128
+                     and 0 < len(self._delta_kernels) < n)
+        if use_delta:
+            # Near zero density the logarithm can amplify cancellation error.
+            # Budget roundoff against the regularization floor in raw KDE units
+            # rather than assuming every BARRIER and bandwidth is safe to cache.
+            amps = np.asarray([d[0] for d in self._delta_kernels], dtype=np.float64)
+            error = self._bias_probability_error + 8 * np.finfo(np.float64).eps * (
+                np.max(self._bias_probability_sum) + np.sum(np.abs(amps))
+            )
+            raw_floor = self.epsilon * self.sum_weights * self.Zed
+            use_delta = error <= 1e-5 * raw_floor
+        if use_delta:
+            delta = self._delta_kernels
+            self._accumulate_probability_grid(
+                self._bias_probability_sum,
+                np.asarray([d[1] for d in delta], dtype=np.float64),
+                np.asarray([d[2] for d in delta], dtype=np.float64),
+                amps,
+            )
+            # Exact KDE sums are nonnegative. Remove tiny negative residues
+            # left by subtracting removed kernels before taking the logarithm.
+            np.maximum(self._bias_probability_sum, 0.0,
+                       out=self._bias_probability_sum)
+            self._bias_probability_updates += 1
+            self._bias_probability_error = error
+        else:
+            self._bias_probability_sum = np.zeros(
+                (self.bias_grid_points, self.bias_grid_points), dtype=np.float64
+            )
+            if n > 0:
+                self._accumulate_probability_grid(
+                    self._bias_probability_sum,
+                    self._np_centers, self._np_sigmas, self._np_amps,
+                )
+            self._bias_probability_updates = 0
+            self._bias_probability_error = 0.0
+        self._bias_probability_revision = self._kernel_revision
+        prob = self._bias_probability_sum.copy()
 
         if self.sum_weights > 0:
-            prob /= self.sum_weights
+            prob *= (1.0 / self.sum_weights)
 
         regularized = prob / self.Zed + self.epsilon
-        regularized = np.clip(regularized, self.epsilon, None)
+        np.clip(regularized, self.epsilon, None, out=regularized)
         coeff = (1.0 - 1.0 / self.bias_factor) * self.kT
         bias = coeff * np.log(regularized)
         bias -= np.min(bias)
@@ -365,26 +483,139 @@ class OPES:
 
         return float(bias)
 
-    def _updateZn(self):
-        """Update the exact PLUMED-style Zed normalization.
+    # ------------------------------------------------------------------
+    # Zed normalisation — incremental update (OPESmetad.cpp pattern)
+    # ------------------------------------------------------------------
 
-        Zed = Σ_k Σ_{k'} evaluateKernel(k', center_k) / (KDEnorm × N_kernels)
+    def _updateZn(self):
+        """Update Zed using incremental delta-kernel approach.
+
+        Instead of the O(N²) full double-sum over all kernel pairs,
+        this tracks which kernels were added/removed (delta_kernels)
+        and computes only the O(N·D) correction, where D is typically 2-3.
+
+        Falls back to the full (but numpy-vectorized) computation when
+        the kernel set is very small or no delta information is available.
         """
         if len(self.kernels) == 0 or self.sum_weights <= 0:
             self.Zed = 1.0
             self.Zn = 1.0
             return
 
-        sum_uprob = 0.0
-        for kernel in self.kernels:
-            center = self._kernel_center(kernel)
-            for other_kernel in self.kernels:
-                sum_uprob += self._evaluateKernel(other_kernel, center)
+        n_kernels = len(self.kernels)
+        n_delta = len(self._delta_kernels)
+        old_KDEnorm = self._old_KDEnorm
+        old_nker = self._old_nker
 
-        self.Zed = sum_uprob / self.sum_weights / len(self.kernels)
+        # Heuristic from OPESmetad.cpp: full recomputation is cheaper when
+        # N² < 3·N·D + 2·D² (+ some overhead constant).
+        few_kernels = (n_kernels * n_kernels
+                       < 3 * n_kernels * n_delta + 2 * n_delta * n_delta + 100)
+
+        if old_nker == 0 or old_KDEnorm <= 0 or n_delta == 0 or few_kernels:
+            self._updateZn_full()
+            return
+
+        # --- Incremental update ---
+        delta_sum = 0.0
+
+        for d in range(n_delta):
+            d_height, d_center, d_sigma = self._delta_kernels[d]
+            d_center_arr = np.asarray(d_center, dtype=np.float64)
+            d_sigma_arr = np.asarray(d_sigma, dtype=np.float64)
+            d_sign = 1.0 if d_height >= 0 else -1.0
+
+            # Part A: evaluateKernel(delta_d, center_k) for all k
+            diff1 = self._np_centers - d_center_arr[np.newaxis, :]   # (N, ncv)
+            for j in range(self.num_cvs):
+                if self.periodic[j] is not None:
+                    p = self.periodic[j][1] - self.periodic[j][0]
+                    diff1[:, j] -= p * np.round(diff1[:, j] / p)
+            norm2_1 = np.sum((diff1 / d_sigma_arr[np.newaxis, :]) ** 2, axis=1)
+            mask1 = norm2_1 < self.kernel_cutoff2
+            vals1 = np.where(mask1,
+                             d_height * (np.exp(-0.5 * norm2_1) - self.val_at_cutoff),
+                             0.0)
+
+            # Part B: sign * evaluateKernel(kernel_k, center_d) for all k
+            diff2 = d_center_arr[np.newaxis, :] - self._np_centers   # (N, ncv)
+            for j in range(self.num_cvs):
+                if self.periodic[j] is not None:
+                    p = self.periodic[j][1] - self.periodic[j][0]
+                    diff2[:, j] -= p * np.round(diff2[:, j] / p)
+            norm2_2 = np.sum((diff2 / self._np_sigmas) ** 2, axis=1)
+            mask2 = norm2_2 < self.kernel_cutoff2
+            vals2 = np.where(mask2,
+                             d_sign * self._np_amps * (np.exp(-0.5 * norm2_2)
+                                                       - self.val_at_cutoff),
+                             0.0)
+
+            delta_sum += float(np.sum(vals1) + np.sum(vals2))
+
+        # Part C: subtract delta–delta overcounting (D² terms, D is tiny)
+        for d in range(n_delta):
+            d_h, d_c, d_s = self._delta_kernels[d]
+            d_sign = 1.0 if d_h >= 0 else -1.0
+            d_c_arr = np.asarray(d_c, dtype=np.float64)
+            for dd in range(n_delta):
+                dd_h, dd_c, dd_s = self._delta_kernels[dd]
+                dd_c_arr = np.asarray(dd_c, dtype=np.float64)
+                dd_s_arr = np.asarray(dd_s, dtype=np.float64)
+                diff = d_c_arr - dd_c_arr
+                for j in range(self.num_cvs):
+                    if self.periodic[j] is not None:
+                        p = self.periodic[j][1] - self.periodic[j][0]
+                        diff[j] -= p * round(float(diff[j]) / p)
+                n2 = float(np.sum((diff / dd_s_arr) ** 2))
+                if n2 < self.kernel_cutoff2:
+                    delta_sum -= d_sign * dd_h * (math.exp(-0.5 * n2)
+                                                  - self.val_at_cutoff)
+
+        sum_uprob = self.Zed * old_KDEnorm * old_nker + delta_sum
+        self.Zed = sum_uprob / self.sum_weights / n_kernels
         self.Zn = self.Zed
 
-    def _updateBiasExpression(self, context=None):
+    def _updateZn_full(self):
+        """Full Zed computation, fully vectorized with numpy.
+
+        O(N²) in kernel evaluations, processed in chunks to bound memory
+        at O(C*N) instead of O(N²).  Eliminates the Python for-loop that
+        previously iterated over each kernel individually.
+        """
+        if len(self.kernels) == 0 or self.sum_weights <= 0:
+            self.Zed = 1.0
+            self.Zn = 1.0
+            return
+
+        n = len(self.kernels)
+        centers = self._np_centers   # (N, ncv)
+        sigmas = self._np_sigmas     # (N, ncv)
+        amps = self._np_amps         # (N,)
+        sum_uprob = 0.0
+
+        # Process outer dimension in chunks to cap memory at chunk*N*ncv
+        chunk = min(n, 64)
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            # (C, 1, ncv) - (1, N, ncv) → (C, N, ncv)
+            diff = (centers[start:end, np.newaxis, :]
+                    - centers[np.newaxis, :, :])
+            for j in range(self.num_cvs):
+                if self.periodic[j] is not None:
+                    p = self.periodic[j][1] - self.periodic[j][0]
+                    diff[:, :, j] -= p * np.round(diff[:, :, j] / p)
+            norm2 = np.sum((diff / sigmas[np.newaxis, :, :]) ** 2, axis=2)  # (C, N)
+            mask = norm2 < self.kernel_cutoff2
+            vals = np.where(mask,
+                            amps[np.newaxis, :] * (np.exp(-0.5 * norm2)
+                                                   - self.val_at_cutoff),
+                            0.0)
+            sum_uprob += float(np.sum(vals))
+
+        self.Zed = sum_uprob / self.sum_weights / n
+        self.Zn = self.Zed
+
+    def _updateBiasExpression(self, context=None, incremental=False):
         """
         Update the bias energy expression.
 
@@ -394,7 +625,7 @@ class OPES:
         if self.use_tabulated_bias:
             if self.bias_function is None:
                 return
-            values = self._build_bias_table()
+            values = self._build_bias_table(incremental=incremental)
             if values is None:
                 return
             periodic0 = self._periodic_range(0)
@@ -493,34 +724,43 @@ class OPES:
     # ------------------------------------------------------------------
 
     def _getMergeableKernel(self, center, exclude_idx):
-        """Find the closest existing kernel within the compression threshold.
+        """Find the closest kernel within the compression threshold.
 
-        Uses the *target* kernel's sigma for the distance metric, matching
-        PLUMED's getMergeableKernel().
-
-        Returns (index, norm2) or (None, threshold2) if no match.
+        Vectorized with numpy for O(N) with fast constant factors.
+        Reuses cached arrays while the kernel count matches. The only changed
+        kernel before the first recursive lookup is exclude_idx, whose entry
+        is ignored. After a removal, rebuild from the remaining kernels.
         """
-        min_k = None
-        min_norm2 = self.compression_threshold2
+        n = len(self.kernels)
+        if n == 0:
+            return None, self.compression_threshold2
 
-        for k, existing in enumerate(self.kernels):
-            if k == exclude_idx:
-                continue
-            center_k = self._kernel_center(existing)
-            sigma_k = self._kernel_sigma(existing)
-            norm2 = 0.0
-            skip = False
-            for j in range(self.num_cvs):
-                diff = self._periodic_difference(center[j], center_k[j], j)
-                norm2 += (diff / sigma_k[j]) ** 2
-                if norm2 >= min_norm2:
-                    skip = True
-                    break
-            if not skip and norm2 < min_norm2:
-                min_norm2 = norm2
-                min_k = k
+        if len(self._np_centers) == n:
+            centers_arr = self._np_centers
+            sigmas_arr = self._np_sigmas
+        else:
+            centers_arr = np.array([k[:self.num_cvs] for k in self.kernels],
+                                   dtype=np.float64)
+            sigmas_arr = np.array([k[self.num_cvs:2 * self.num_cvs]
+                                   for k in self.kernels], dtype=np.float64)
 
-        return min_k, min_norm2
+        center_arr = np.asarray(center, dtype=np.float64)
+        diff = center_arr[np.newaxis, :] - centers_arr          # (N, ncv)
+        for j in range(self.num_cvs):
+            if self.periodic[j] is not None:
+                period = self.periodic[j][1] - self.periodic[j][0]
+                diff[:, j] -= period * np.round(diff[:, j] / period)
+        norm2 = np.sum((diff / sigmas_arr) ** 2, axis=1)       # (N,)
+
+        if 0 <= exclude_idx < n:
+            norm2[exclude_idx] = np.inf
+
+        min_k = int(np.argmin(norm2))
+        min_norm2 = float(norm2[min_k])
+
+        if min_norm2 < self.compression_threshold2:
+            return min_k, min_norm2
+        return None, self.compression_threshold2
 
     def _mergeKernels(self, target, source):
         """Merge *source* kernel into *target* kernel in-place.
@@ -560,14 +800,34 @@ class OPES:
         target[2 * self.num_cvs + 1] = 1.0
 
     def _addKernel(self, kernel):
-        """Add a kernel, attempting PLUMED-style merge + recursive merge."""
+        """Add a kernel with PLUMED-style merge + recursive merge.
+
+        Also populates self._delta_kernels for the incremental Zed update.
+        """
+        self._kernel_revision += 1
         if self.compression_threshold2 > 0 and len(self.kernels) > 0:
             center_new = self._kernel_center(kernel)
             taker_k, norm2 = self._getMergeableKernel(center_new, exclude_idx=-1)
 
             if taker_k is not None:
+                # Snapshot the old taker (negative = removed)
+                old = self.kernels[taker_k]
+                self._delta_kernels.append((
+                    -self._kernel_amplitude(old),
+                    self._kernel_center(old),
+                    self._kernel_sigma(old),
+                ))
+
                 # Merge new kernel into the closest existing one
                 self._mergeKernels(self.kernels[taker_k], kernel)
+
+                # Snapshot the new taker (positive = added)
+                new = self.kernels[taker_k]
+                self._delta_kernels.append((
+                    self._kernel_amplitude(new),
+                    self._kernel_center(new),
+                    self._kernel_sigma(new),
+                ))
 
                 # Recursive merge: the merged kernel might now overlap another
                 giver_k = taker_k
@@ -576,16 +836,42 @@ class OPES:
                     taker_k2, norm2_2 = self._getMergeableKernel(center_g, exclude_idx=giver_k)
                     if taker_k2 is None:
                         break
+
+                    # The last delta (positive) is about to be merged again — pop it
+                    self._delta_kernels.pop()
+
+                    # Snapshot old taker2 (negative = removed)
+                    old2 = self.kernels[taker_k2]
+                    self._delta_kernels.append((
+                        -self._kernel_amplitude(old2),
+                        self._kernel_center(old2),
+                        self._kernel_sigma(old2),
+                    ))
+
                     # Keep the lower index to avoid shifting issues on pop
                     if taker_k2 > giver_k:
                         taker_k2, giver_k = giver_k, taker_k2
                     self._mergeKernels(self.kernels[taker_k2], self.kernels[giver_k])
+
+                    # Snapshot new merged result (positive = added)
+                    merged = self.kernels[taker_k2]
+                    self._delta_kernels.append((
+                        self._kernel_amplitude(merged),
+                        self._kernel_center(merged),
+                        self._kernel_sigma(merged),
+                    ))
+
                     self.kernels.pop(giver_k)
                     giver_k = taker_k2
                 return
 
         # No merge — append as a new kernel
         self.kernels.append(list(kernel))
+        self._delta_kernels.append((
+            self._kernel_amplitude(kernel),
+            self._kernel_center(kernel),
+            self._kernel_sigma(kernel),
+        ))
 
     def _evaluateProbability(self, cv_values):
         """
@@ -637,12 +923,18 @@ class OPES:
                 cv_values = self.force.getCollectiveVariableValues(simulation.context)
                 cv_values = [float(x) for x in cv_values]
 
+                # Build numpy cache for vectorized bias evaluation
+                self._build_numpy_cache()
+
                 # ---- 1. log_weight from the current bias ----
                 current_bias = self._evaluateBias(cv_values)
                 log_weight = self.beta * current_bias
                 raw_weight = math.exp(log_weight)
 
-                # ---- 2. Accumulate sum_weights BEFORE sigma rescaling ----
+                # ---- 2. Save old state for incremental Zed ----
+                self._old_KDEnorm = self.sum_weights   # KDEnorm BEFORE update
+                self._old_nker = len(self.kernels)       # N_kernels BEFORE add
+
                 self._counter += 1
                 self.sum_weights += raw_weight
                 self.sum_weights_sq += raw_weight ** 2
@@ -663,6 +955,7 @@ class OPES:
                     kernel_height *= s0 / s
 
                 # ---- 6. Add kernel (with PLUMED-style compression) ----
+                self._delta_kernels = []
                 kernel = self._kernel_row(cv_values, self.sigma_vals,
                                           kernel_height, 1.0)
                 old_nker = len(self.kernels)
@@ -671,14 +964,15 @@ class OPES:
                 if new_nker < old_nker:
                     print(f"OPES: Compressed {old_nker + 1} → {new_nker} kernels")
 
-                # ---- 7. Update Zed ----
+                # ---- 7. Update Zed (incremental when possible) ----
+                self._build_numpy_cache()
                 self._updateZn()
 
                 # ---- 8. Rebuild bias expression / table ----
                 if ((not self.use_tabulated_bias)
                         or (self.kernel_counter % self.bias_update_stride == 0)
                         or self.kernel_counter == 1):
-                    self._updateBiasExpression(simulation.context)
+                    self._updateBiasExpression(simulation.context, incremental=True)
 
                 # Save periodically
                 if self.biasDir and (self.step_count % self.saveFrequency == 0):
@@ -736,6 +1030,7 @@ class OPES:
     def loadKernels(self, filename):
         """Load kernels from file."""
 
+        self._kernel_revision += 1
         self.kernels = []
         if filename.endswith('.npz'):
             data = np.load(filename)
@@ -756,32 +1051,64 @@ class OPES:
                     if len(values) in (self.num_cvs + 2, 2 * self.num_cvs + 2):
                         self.kernels.append(values)
 
-        # Only rebuild Zed and bias (sum_weights is restored from file or
-        # must be left as-is — never recalculated from kernel amplitudes).
-        self._updateZn()
+        # Rebuild numpy cache and Zed/bias from loaded kernels
+        self._build_numpy_cache()
+        self._updateZn_full()
         self._updateBiasExpression()
 
         print(f"Loaded {len(self.kernels)} kernels from {filename}")
 
     def getFreeEnergy(self, cv_grid):
         """
-        Estimate free energy on a grid.
+        Estimate free energy on a grid (vectorized).
 
         F(s) = -kT * log(P(s))
         """
+        self._build_numpy_cache()
 
         grids = np.meshgrid(*cv_grid, indexing='ij')
         shape = grids[0].shape
 
-        cv_points = np.array([g.flatten() for g in grids]).T
+        cv_points = np.array([g.flatten() for g in grids]).T   # (M, ncv)
+        M = len(cv_points)
 
-        free_energy = np.zeros(len(cv_points))
-        for i, point in enumerate(cv_points):
-            prob = self._evaluateProbability(point)
-            if prob > 0:
-                free_energy[i] = -self.kT * math.log(prob)
-            else:
-                free_energy[i] = np.inf
+        if len(self.kernels) == 0 or self.sum_weights <= 0:
+            return np.zeros(shape)
+
+        free_energy = np.full(M, np.inf)
+
+        # Process in chunks to limit memory: chunk × N × ncv
+        chunk_size = 512
+        for start in range(0, M, chunk_size):
+            end = min(start + chunk_size, M)
+            chunk = cv_points[start:end]                          # (C, ncv)
+
+            # (C, 1, ncv) - (1, N, ncv) → (C, N, ncv)
+            diff = (chunk[:, np.newaxis, :]
+                    - self._np_centers[np.newaxis, :, :])
+            for j in range(self.num_cvs):
+                if self.periodic[j] is not None:
+                    p = self.periodic[j][1] - self.periodic[j][0]
+                    diff[:, :, j] -= p * np.round(diff[:, :, j] / p)
+
+            norm2 = np.sum(
+                (diff / self._np_sigmas[np.newaxis, :, :]) ** 2,
+                axis=2,
+            )                                                      # (C, N)
+            mask = norm2 < self.kernel_cutoff2
+            gaussian = np.where(
+                mask,
+                np.exp(-0.5 * norm2) - self.val_at_cutoff,
+                0.0,
+            )                                                      # (C, N)
+            prob = (np.sum(self._np_amps[np.newaxis, :] * gaussian, axis=1)
+                    / self.sum_weights)                            # (C,)
+            valid = prob > 0
+            free_energy[start:end] = np.where(
+                valid,
+                -self.kT * np.log(np.where(valid, prob, 1.0)),
+                np.inf,
+            )
 
         free_energy = free_energy.reshape(shape)
         free_energy -= np.nanmin(free_energy)
